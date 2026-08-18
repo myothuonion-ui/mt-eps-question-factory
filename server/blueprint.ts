@@ -1,8 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import type { ExamSet, ExamSlot, ImportAnalysis, NormalizedQuestion, QuestionType } from '../src/shared/types.js';
-import { generateQuestion } from './providers/aiProvider.js';
+import { generateQuestionBatch, type GenerationSpec } from './providers/aiProvider.js';
 import { finalizeListeningSlots, prepareListeningReference } from './listeningPipeline.js';
 import { runQaForSet } from './qa.js';
+import { getProviderSettings } from './providerSettings.js';
+import type { ProgressEvent } from './jobManager.js';
 
 function defaultReadingType(slot: number): QuestionType {
   const index = slot - 20;
@@ -49,15 +51,26 @@ function examplesFor(slot: ExamSlot, questions: NormalizedQuestion[]) {
     .slice(0, 5);
 }
 
-export async function complete40QuestionSet(analysis: ImportAnalysis, name?: string): Promise<ExamSet> {
+type Reporter = (event: ProgressEvent) => void;
+
+export async function complete40QuestionSet(analysis: ImportAnalysis, name?: string, report?: Reporter): Promise<ExamSet> {
   const slots = createBlueprint(analysis, false);
+  const specs: GenerationSpec[] = [];
+  const preparedBySlot = new Map<number, Awaited<ReturnType<typeof prepareListeningReference>>>();
+  report?.({ stage: 'prepare', percent: 2, question: null, completedQuestions: 0, message: `Preparing 40 slots from ${analysis.questions.length} analyzed source questions.` });
+
   for (const slot of slots) {
     const chapter = chapterForSlot(slot.slot, analysis);
     const reference = analysis.questions.find(item => item.sourceOrder === slot.slot);
     const hasOwnedMedia = slot.section === 'listening' && !!reference?.media?.some(item => item.kind === 'youtube' || item.kind === 'audio' || item.kind === 'video');
-    const prepared = hasOwnedMedia && reference ? await prepareListeningReference(reference) : null;
-
-    const question = await generateQuestion({
+    report?.({ stage: 'prepare', percent: 2 + (slot.slot / 40) * 8, question: slot.slot, completedQuestions: 0, message: `Q${slot.slot}: pattern ${slot.patternId}, Chapter ${chapter}, ${slot.expectedType}.` });
+    let prepared: Awaited<ReturnType<typeof prepareListeningReference>> = null;
+    if (hasOwnedMedia && reference) {
+      report?.({ stage: 'prepare', percent: 2 + (slot.slot / 40) * 8, question: slot.slot, message: `Q${slot.slot}: preparing owned listening source and transcript context.` });
+      prepared = await prepareListeningReference(reference);
+      preparedBySlot.set(slot.slot, prepared);
+    }
+    specs.push({
       slot: slot.slot,
       section: slot.section,
       expectedType: slot.expectedType,
@@ -67,22 +80,61 @@ export async function complete40QuestionSet(analysis: ImportAnalysis, name?: str
       listeningContext: prepared?.transcript ?? null,
       mediaConstrained: hasOwnedMedia
     });
-
-    if (slot.section === 'listening' && reference?.media?.length) {
-      question.media = reference.media.filter(item => item.kind === 'youtube' || item.kind === 'audio' || item.kind === 'video');
-      question.provenance.sourceQuestionId = reference.id;
-      question.provenance.sourceUrl = reference.provenance.sourceUrl;
-      question.provenance.sourceTitle = reference.provenance.sourceTitle;
-      if (prepared?.audioAsset) question.audioAsset = prepared.audioAsset;
-      if (prepared?.flags.length) question.qaFlags = [...new Set([...question.qaFlags, ...prepared.flags])];
-    }
-
-    slot.question = question;
-    slot.generationRequired = false;
   }
 
-  await finalizeListeningSlots(slots);
+  const batchSize = getProviderSettings().batchSize;
+  let completed = 0;
+  for (let start = 0; start < specs.length; start += batchSize) {
+    const batch = specs.slice(start, start + batchSize);
+    const qStart = batch[0].slot;
+    const qEnd = batch[batch.length - 1].slot;
+    report?.({ stage: 'generation', percent: 10 + (completed / 40) * 60, question: qStart, completedQuestions: completed, message: `Generating Q${qStart}–Q${qEnd} as one API batch (${Math.ceil((start + 1) / batchSize)}/${Math.ceil(40 / batchSize)}).` });
+    const generated = await generateQuestionBatch(batch, attempt => {
+      report?.({
+        stage: 'generation',
+        percent: 10 + (completed / 40) * 60,
+        question: qStart,
+        completedQuestions: completed,
+        provider: attempt.provider,
+        fallback: attempt.fallback,
+        level: attempt.level,
+        message: attempt.message
+      });
+    });
+
+    for (let i = 0; i < generated.length; i += 1) {
+      const question = generated[i];
+      const spec = batch[i];
+      const slot = slots[spec.slot - 1];
+      const reference = analysis.questions.find(item => item.sourceOrder === spec.slot);
+      const prepared = preparedBySlot.get(spec.slot);
+      if (slot.section === 'listening' && reference?.media?.length) {
+        question.media = reference.media.filter(item => item.kind === 'youtube' || item.kind === 'audio' || item.kind === 'video');
+        question.provenance.sourceQuestionId = reference.id;
+        question.provenance.sourceUrl = reference.provenance.sourceUrl;
+        question.provenance.sourceTitle = reference.provenance.sourceTitle;
+        if (prepared?.audioAsset) question.audioAsset = prepared.audioAsset;
+        if (prepared?.flags.length) question.qaFlags = [...new Set([...question.qaFlags, ...prepared.flags])];
+      }
+      slot.question = question;
+      slot.generationRequired = false;
+      completed += 1;
+      report?.({ stage: 'generation', percent: 10 + (completed / 40) * 60, question: spec.slot, completedQuestions: completed, provider: question.generatedBy ?? 'unknown', level: 'success', message: `Q${spec.slot}: generated successfully with ${question.generatedBy ?? 'AI'}.` });
+    }
+  }
+
+  report?.({ stage: 'listening', percent: 72, question: 1, completedQuestions: 40, message: 'Finalizing listening audio for Q1–Q20.' });
+  await finalizeListeningSlots(slots, (question, message, level = 'info') => {
+    const percent = 72 + (Math.min(20, Math.max(1, question)) / 20) * 15;
+    report?.({ stage: 'listening', percent, question, completedQuestions: 40, level, message });
+  });
+
+  report?.({ stage: 'qa', percent: 88, question: null, completedQuestions: 40, message: 'Running answer, structure and duplicate QA across all 40 questions.' });
   const qaSlots = runQaForSet(slots);
+  qaSlots.forEach((slot, index) => {
+    report?.({ stage: 'qa', percent: 88 + ((index + 1) / 40) * 8, question: slot.slot, completedQuestions: 40, level: slot.question?.qa?.passed ? 'success' : 'warn', message: `Q${slot.slot}: QA ${slot.question?.qa?.score ?? 0}%${slot.question?.qaFlags?.length ? ` · ${slot.question.qaFlags.join(', ')}` : ''}.` });
+  });
+
   return {
     id: `SET-${Date.now()}-${randomUUID().slice(0, 6)}`,
     name: name?.trim() || `EPS 40Q ${new Date().toLocaleDateString('en-CA')}`,

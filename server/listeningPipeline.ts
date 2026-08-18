@@ -93,15 +93,23 @@ export async function prepareListeningReference(reference: NormalizedQuestion): 
   }
 }
 
-export async function finalizeListeningSlots(slots: ExamSlot[]) {
+export async function finalizeListeningSlots(
+  slots: ExamSlot[],
+  report?: (question: number, message: string, level?: 'info' | 'warn' | 'success') => void
+) {
   const profiles = await listVoiceProfiles();
   const profile = profiles[0];
 
   for (const slot of slots) {
     const question = slot.question;
-    if (!question || slot.section !== 'listening' || question.audioAsset) continue;
+    if (!question || slot.section !== 'listening') continue;
+    if (question.audioAsset) {
+      report?.(slot.slot, `Q${slot.slot}: source listening clip already prepared.`, 'success');
+      continue;
+    }
     const youtube = question.media.find(media => media.kind === 'youtube')?.url;
     if (youtube) {
+      report?.(slot.slot, `Q${slot.slot}: matching YouTube audio segment.`, 'info');
       try {
         const media = await cachedYoutube(youtube);
         const match = bestSegment(question, media);
@@ -115,20 +123,28 @@ export async function finalizeListeningSlots(slots: ExamSlot[]) {
           source: 'youtube'
         };
         if (match.guessed) question.qaFlags = [...new Set([...question.qaFlags, 'YOUTUBE_SEGMENT_GUESSED'])];
+        report?.(slot.slot, `Q${slot.slot}: YouTube listening clip ready (${Math.round(match.segment.end - match.segment.start)}s).`, match.guessed ? 'warn' : 'success');
       } catch (error) {
-        question.qaFlags = [...new Set([...question.qaFlags, `YOUTUBE_AUDIO_PENDING:${error instanceof Error ? error.message : 'unknown'}`])];
+        const text = error instanceof Error ? error.message : 'unknown';
+        question.qaFlags = [...new Set([...question.qaFlags, `YOUTUBE_AUDIO_PENDING:${text}`])];
+        report?.(slot.slot, `Q${slot.slot}: YouTube audio pending · ${text}`, 'warn');
       }
       continue;
     }
 
     if (question.listeningScript?.length && profile) {
+      report?.(slot.slot, `Q${slot.slot}: generating TTS listening audio.`, 'info');
       try {
         question.audioAsset = await generateListeningAudio(question, profile);
+        report?.(slot.slot, `Q${slot.slot}: TTS audio ready.`, 'success');
       } catch (error) {
-        question.qaFlags = [...new Set([...question.qaFlags, `TTS_AUDIO_PENDING:${error instanceof Error ? error.message : 'unknown'}`])];
+        const text = error instanceof Error ? error.message : 'unknown';
+        question.qaFlags = [...new Set([...question.qaFlags, `TTS_AUDIO_PENDING:${text}`])];
+        report?.(slot.slot, `Q${slot.slot}: TTS audio pending · ${text}`, 'warn');
       }
     } else {
       question.qaFlags = [...new Set([...question.qaFlags, 'LISTENING_AUDIO_SOURCE_MISSING'])];
+      report?.(slot.slot, `Q${slot.slot}: no listening source or script found.`, 'warn');
     }
   }
   return slots;

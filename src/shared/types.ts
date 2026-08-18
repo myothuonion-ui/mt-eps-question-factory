@@ -65,6 +65,18 @@ export type NormalizedQuestion = {
   };
 };
 
+export type AnalysisDiagnostics = {
+  parserStrategy: string;
+  candidateBlockCounts: Record<string, number>;
+  selectedBlockCount: number;
+  rawHtmlBytes: number;
+  optionHistogram: Record<string, number>;
+  globalYoutube: number;
+  globalImages: number;
+  answerEvidenceCount: number;
+  warnings: string[];
+};
+
 export type ImportAnalysis = {
   id?: string;
   sourceUrl: string;
@@ -72,6 +84,7 @@ export type ImportAnalysis = {
   importedAt: string;
   mediaPool?: MediaRef[];
   generationChapters?: number[];
+  diagnostics?: AnalysisDiagnostics;
   counts: {
     questions: number;
     listening: number;
@@ -149,11 +162,47 @@ export type MediaAnalysis = {
   flags: string[];
 };
 
+export type ProviderOrder = 'gemini-glm' | 'glm-gemini' | 'gemini' | 'glm' | 'mock';
+export type ProviderSettings = {
+  order: ProviderOrder;
+  batchSize: number;
+  gemini: { configured: boolean; model: string };
+  glm: { configured: boolean; baseUrl: string; model: string };
+  cloudflare: { configured: boolean; accountId: string; imageModel: string };
+};
+
+export type GenerationJobStage = 'queued' | 'prepare' | 'generation' | 'listening' | 'qa' | 'save' | 'done' | 'error';
+export type GenerationJobLog = {
+  id: string;
+  at: string;
+  level: 'info' | 'warn' | 'error' | 'success';
+  stage: GenerationJobStage;
+  question?: number | null;
+  message: string;
+};
+export type GenerationJob = {
+  id: string;
+  status: 'queued' | 'running' | 'completed' | 'failed';
+  percent: number;
+  stage: GenerationJobStage;
+  currentQuestion: number | null;
+  completedQuestions: number;
+  totalQuestions: number;
+  provider: string;
+  fallbackCount: number;
+  createdAt: string;
+  updatedAt: string;
+  setId?: string | null;
+  error?: string | null;
+  logs: GenerationJobLog[];
+};
+
 export type SystemStatus = {
   version: string;
   localMode: true;
   aiProvider: string;
   ttsProvider: string;
+  providers?: ProviderSettings;
   tools: {
     ffmpeg: boolean;
     ytdlp: boolean;
