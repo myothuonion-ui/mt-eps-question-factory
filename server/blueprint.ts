@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { ExamSet, ExamSlot, ImportAnalysis, NormalizedQuestion, QuestionType } from '../src/shared/types.js';
 import { generateQuestion } from './providers/aiProvider.js';
+import { finalizeListeningSlots } from './listeningPipeline.js';
 import { runQaForSet } from './qa.js';
 
 function defaultReadingType(slot: number): QuestionType {
@@ -62,6 +63,7 @@ export async function complete40QuestionSet(analysis: ImportAnalysis, name?: str
     slot.generationRequired = false;
   }
 
+  await finalizeListeningSlots(slots);
   const qaSlots = runQaForSet(slots);
   return {
     id: `SET-${Date.now()}-${randomUUID().slice(0, 6)}`,
