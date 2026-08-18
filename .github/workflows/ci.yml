@@ -16,3 +16,19 @@ jobs:
       - run: npm install --no-audit --no-fund
       - run: npm run typecheck
       - run: npm run build
+      - name: Production runtime smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          NODE_ENV=production PORT=8787 AI_PROVIDER=mock node dist/server.mjs >/tmp/factory.log 2>&1 &
+          PID=$!
+          trap 'kill $PID 2>/dev/null || true; cat /tmp/factory.log' EXIT
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8787/api/health >/tmp/health.json; then break; fi
+            sleep 1
+          done
+          cat /tmp/health.json
+          curl -fsS -X POST http://127.0.0.1:8787/api/exam/complete-40 \
+            -H 'content-type: application/json' \
+            --data '{"analysis":{"id":"smoke","sourceUrl":"local://smoke","sourceTitle":"Smoke","importedAt":"2026-08-18T00:00:00Z","counts":{"questions":0,"listening":0,"reading":0,"images":0,"youtube":0,"answersDetected":0},"questions":[]}}' >/tmp/set.json
+          node -e "const x=require('/tmp/set.json'); if(!x.ok || !x.set.complete || x.set.slots.length!==40) process.exit(1); console.log('40Q smoke:', x.set.slots.length, x.set.complete)"
