@@ -22,7 +22,7 @@ function canonicalYoutube(raw: string): string | null {
   return match ? match[0].replace(/\\u0026/g, '&').replace(/\\\//g, '/') : null;
 }
 
-function collectMedia($: cheerio.CheerioAPI, el: cheerio.Element): MediaRef[] {
+function collectMedia($: cheerio.CheerioAPI, el: any): MediaRef[] {
   const media: MediaRef[] = [];
   $(el).find('img[src]').each((_, node) => {
     const src = $(node).attr('src');
@@ -41,7 +41,7 @@ function collectMedia($: cheerio.CheerioAPI, el: cheerio.Element): MediaRef[] {
   return [...new Map(media.map(item => [`${item.kind}:${item.url}`, item])).values()];
 }
 
-function optionCandidates($: cheerio.CheerioAPI, el: cheerio.Element) {
+function optionCandidates($: cheerio.CheerioAPI, el: any) {
   const selectors = [
     '.aDTYNe',
     '.docssharedWizToggleLabeledLabelText',
@@ -61,7 +61,7 @@ function optionCandidates($: cheerio.CheerioAPI, el: cheerio.Element) {
   return out.slice(0, 10);
 }
 
-function questionStem($: cheerio.CheerioAPI, el: cheerio.Element) {
+function questionStem($: cheerio.CheerioAPI, el: any) {
   const selectors = ['.M7eMe', '.HoXoMd', '[role="heading"]', '.freebirdFormviewerViewItemsItemItemTitle'];
   for (const selector of selectors) {
     const text = clean($(el).find(selector).first().text());
@@ -71,7 +71,7 @@ function questionStem($: cheerio.CheerioAPI, el: cheerio.Element) {
   return text.slice(0, 1000);
 }
 
-function detectCorrectAnswer($: cheerio.CheerioAPI, el: cheerio.Element, options: string[]) {
+function detectCorrectAnswer($: cheerio.CheerioAPI, el: any, options: string[]) {
   let evidence: string | null = null;
   let index: number | null = null;
 
@@ -128,7 +128,7 @@ export async function importGoogleFormViewScore(sourceUrl: string): Promise<Impo
   const questions: NormalizedQuestion[] = [];
   const seen = new Set<string>();
 
-  blocks.forEach((block, blockIndex) => {
+  blocks.forEach(block => {
     const stem = questionStem($, block);
     if (!stem || stem.length < 2) return;
     const options = optionCandidates($, block).filter(option => option !== stem);
