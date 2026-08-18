@@ -49,7 +49,7 @@ export function reportGenerationProgress(id: string, event: ProgressEvent) {
   if (event.question !== undefined) job.currentQuestion = event.question;
   if (event.completedQuestions !== undefined) job.completedQuestions = event.completedQuestions;
   if (event.provider) job.provider = event.provider;
-  if (event.fallback) job.fallbackCount += 1;
+  if (event.fallback && event.level === 'warn') job.fallbackCount += 1;
   job.updatedAt = now;
   const log: GenerationJobLog = {
     id: `LOG-${randomUUID()}`,
