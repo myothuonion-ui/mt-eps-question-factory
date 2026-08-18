@@ -252,7 +252,10 @@ const isProduction = process.env.NODE_ENV === 'production';
 if (isProduction) {
   const currentDir = path.dirname(fileURLToPath(import.meta.url));
   app.use(express.static(currentDir));
-  app.get('*', (_req, res) => res.sendFile(path.join(currentDir, 'index.html')));
+  app.use((req, res, next) => {
+    if (req.method !== 'GET' || req.path.startsWith('/api/') || req.path.startsWith('/local-files/')) return next();
+    return res.sendFile(path.join(currentDir, 'index.html'));
+  });
 } else {
   const { createServer: createViteServer } = await import('vite');
   const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
