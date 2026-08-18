@@ -30,13 +30,15 @@ if not errorlevel 1 (
   echo Press ENTER with nothing to keep mock mode.
   set /p "MT_GEMINI_KEY=Gemini API key: "
   if defined MT_GEMINI_KEY (
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "$p='.env'; $c=Get-Content $p -Raw; $c=$c -replace '(?m)^AI_PROVIDER=.*$','AI_PROVIDER=gemini'; $c=$c -replace '(?m)^GEMINI_API_KEY=.*$',('GEMINI_API_KEY=' + $env:MT_GEMINI_KEY); Set-Content -Path $p -Value $c -Encoding UTF8" 
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "$p='.env'; $c=Get-Content $p -Raw; $c=$c -replace '(?m)^AI_PROVIDER=.*$','AI_PROVIDER=gemini'; $c=$c -replace '(?m)^GEMINI_API_KEY=.*$',('GEMINI_API_KEY=' + $env:MT_GEMINI_KEY); Set-Content -Path $p -Value $c -Encoding UTF8"
     if errorlevel 1 goto :fail
     echo [OK] Gemini configured locally. You will not need to enter it again.
   )
 )
 
-start "" http://127.0.0.1:8787
+echo [START] Launching local server...
+rem Open the browser only after /api/health is reachable, avoiding ERR_CONNECTION_REFUSED on first start.
+start "MT EPS Browser Wait" /min powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "$u='http://127.0.0.1:8787/api/health'; for($i=0;$i -lt 120;$i++){ try { $r=Invoke-WebRequest -UseBasicParsing -Uri $u -TimeoutSec 2; if($r.StatusCode -eq 200){ Start-Process 'http://127.0.0.1:8787'; exit 0 } } catch {}; Start-Sleep -Milliseconds 500 }; exit 1"
 call npm run dev
 exit /b %errorlevel%
 
