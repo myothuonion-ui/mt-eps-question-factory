@@ -12,7 +12,7 @@ function defaultReadingType(slot: number): QuestionType {
   return 'reading';
 }
 
-export function createBlueprint(analysis?: ImportAnalysis | null): ExamSlot[] {
+export function createBlueprint(analysis?: ImportAnalysis | null, includeImportedQuestions = true): ExamSlot[] {
   const ordered = [...(analysis?.questions ?? [])].sort((a, b) => a.sourceOrder - b.sourceOrder);
   return Array.from({ length: 40 }, (_, index) => {
     const slot = index + 1;
@@ -21,13 +21,17 @@ export function createBlueprint(analysis?: ImportAnalysis | null): ExamSlot[] {
     const expectedType: QuestionType = source?.type && source.type !== 'unknown'
       ? source.type
       : section === 'listening' ? 'listening' : defaultReadingType(slot);
+    const patternId = `${section === 'listening' ? 'L' : 'R'}${String(section === 'listening' ? slot : slot - 20).padStart(2, '0')}`;
+    const imported = includeImportedQuestions && source
+      ? { ...source, patternId, origin: source.origin ?? 'imported' as const, reviewState: source.reviewState ?? 'not_reviewed' as const, revision: source.revision ?? 1 }
+      : null;
     return {
       slot,
       section,
-      patternId: `${section === 'listening' ? 'L' : 'R'}${String(section === 'listening' ? slot : slot - 20).padStart(2, '0')}`,
+      patternId,
       expectedType,
-      question: source ? { ...source, patternId: `${section === 'listening' ? 'L' : 'R'}${String(section === 'listening' ? slot : slot - 20).padStart(2, '0')}`, origin: source.origin ?? 'imported', reviewState: source.reviewState ?? 'not_reviewed', revision: source.revision ?? 1 } : null,
-      generationRequired: !source
+      question: imported,
+      generationRequired: !imported
     } satisfies ExamSlot;
   });
 }
@@ -41,15 +45,20 @@ function chapterForSlot(slot: number, questions: NormalizedQuestion[]) {
 }
 
 function examplesFor(slot: ExamSlot, questions: NormalizedQuestion[]) {
+  const exact = questions.find(q => q.sourceOrder === slot.slot);
   const sameType = questions.filter(q => q.type === slot.expectedType);
   const sameSection = questions.filter(q => slot.section === 'listening' ? q.type === 'listening' : q.type !== 'listening');
-  return [...sameType, ...sameSection].filter((q, i, arr) => arr.findIndex(item => item.id === q.id) === i).slice(0, 5);
+  return [exact, ...sameType, ...sameSection]
+    .filter((q): q is NormalizedQuestion => !!q)
+    .filter((q, i, arr) => arr.findIndex(item => item.id === q.id) === i)
+    .slice(0, 5);
 }
 
 export async function complete40QuestionSet(analysis: ImportAnalysis, name?: string): Promise<ExamSet> {
-  const slots = createBlueprint(analysis);
+  // Imported questions are references/pattern examples. The finished set is freshly generated.
+  // This avoids simply copying a 40-question Google Form into the output set.
+  const slots = createBlueprint(analysis, false);
   for (const slot of slots) {
-    if (slot.question) continue;
     const chapter = chapterForSlot(slot.slot, analysis.questions);
     const question = await generateQuestion({
       slot: slot.slot,
@@ -59,6 +68,17 @@ export async function complete40QuestionSet(analysis: ImportAnalysis, name?: str
       chapter,
       sourceExamples: examplesFor(slot, analysis.questions)
     });
+
+    // Preserve source media references so listening questions can reuse the teacher's
+    // YouTube/audio/video source during the automatic listening finalization phase.
+    const reference = analysis.questions.find(item => item.sourceOrder === slot.slot);
+    if (slot.section === 'listening' && reference?.media?.length) {
+      question.media = reference.media.filter(item => item.kind === 'youtube' || item.kind === 'audio' || item.kind === 'video');
+      question.provenance.sourceQuestionId = reference.id;
+      question.provenance.sourceUrl = reference.provenance.sourceUrl;
+      question.provenance.sourceTitle = reference.provenance.sourceTitle;
+    }
+
     slot.question = question;
     slot.generationRequired = false;
   }
@@ -80,7 +100,7 @@ export async function complete40QuestionSet(analysis: ImportAnalysis, name?: str
 }
 
 export function buildStructureOnly(analysis: ImportAnalysis): ExamSet {
-  const slots = createBlueprint(analysis);
+  const slots = createBlueprint(analysis, true);
   return {
     id: `SET-${Date.now()}-${randomUUID().slice(0, 6)}`,
     sourceImportId: analysis.id ?? null,
