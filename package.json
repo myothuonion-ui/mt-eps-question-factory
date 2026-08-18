@@ -1,7 +1,7 @@
 {
   "name": "mt-eps-question-factory",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "scripts": {
     "dev": "node --env-file-if-exists=.env --import tsx server.ts",
