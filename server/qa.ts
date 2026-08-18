@@ -21,7 +21,8 @@ function basicQa(question: NormalizedQuestion): QaResult {
     uniqueOptions: new Set(question.options.map(option => option.trim())).size === question.options.length,
     answer: question.correctAnswerIndex !== null && question.correctAnswerIndex >= 0 && question.correctAnswerIndex < question.options.length,
     chapter: !!question.chapter.chapter && question.chapter.chapter >= 1 && question.chapter.chapter <= 60,
-    listeningScript: question.type !== 'listening' || !!question.listeningScript?.length || question.media.some(item => item.kind === 'youtube' || item.kind === 'audio' || item.kind === 'video')
+    listeningScript: question.type !== 'listening' || !!question.listeningScript?.length || question.media.some(item => item.kind === 'youtube' || item.kind === 'audio' || item.kind === 'video'),
+    audioReady: question.type !== 'listening' || !!question.audioAsset
   };
   const flags = Object.entries(checks).filter(([, passed]) => !passed).map(([name]) => `QA_${name.toUpperCase()}`);
   const score = Math.round((Object.values(checks).filter(Boolean).length / Object.keys(checks).length) * 100);
