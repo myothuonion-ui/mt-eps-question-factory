@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions
 cd /d "%~dp0"
-title MT EPS Question Factory Launcher
+title MT EPS Question Factory Launcher v0.3.1
 
 where node >nul 2>nul
 if errorlevel 1 (
@@ -11,6 +11,14 @@ if errorlevel 1 (
   exit /b 1
 )
 
+rem Stop a stale local Question Factory server so an older extracted copy cannot keep serving port 8787.
+echo [CHECK] Checking port 8787 for an older Question Factory process...
+for /f "tokens=5" %%P in ('netstat -ano ^| findstr ":8787" ^| findstr "LISTENING"') do (
+  echo [STOP] Closing old local server PID %%P...
+  taskkill /PID %%P /F >nul 2>nul
+)
+timeout /t 1 /nobreak >nul
+
 if not exist node_modules (
   echo [FIRST RUN] Installing app dependencies automatically...
   call npm install --no-audit --no-fund
@@ -19,40 +27,26 @@ if not exist node_modules (
 
 if not exist .env if exist .env.example copy /y .env.example .env >nul
 
-rem First run convenience: Gemini can be entered here once. GLM and Cloudflare can be added later inside 05 API & Tools.
-findstr /B /C:"AI_PROVIDER=mock" .env >nul 2>nul
-if not errorlevel 1 (
-  echo.
-  echo ================================================
-  echo  MT EPS Question Factory - First Run
-  echo ================================================
-  echo Paste your Google AI Studio Gemini API key below.
-  echo Press ENTER with nothing to skip and configure APIs inside the app.
-  set /p "MT_GEMINI_KEY=Gemini API key: "
-  if defined MT_GEMINI_KEY (
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "$p='.env'; $c=Get-Content $p -Raw; $c=$c -replace '(?m)^AI_PROVIDER=.*$','AI_PROVIDER=gemini'; $c=$c -replace '(?m)^GEMINI_API_KEY=.*$',('GEMINI_API_KEY=' + $env:MT_GEMINI_KEY); Set-Content -Path $p -Value $c -Encoding UTF8"
-    if errorlevel 1 goto :fail
-    echo [OK] Gemini configured locally.
-  )
-)
-
-echo [START] Starting local server...
+rem API keys are configured inside the app UI. Do not ask for keys in this terminal.
+echo [START] Starting current folder version...
 start "MT EPS Question Factory Server" /min cmd /k "cd /d "%~dp0" && npm run dev"
 
-for /L %%I in (1,1,45) do (
-  powershell -NoProfile -Command "try { $r=Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:8787/api/health' -TimeoutSec 1; if ($r.StatusCode -eq 200) { exit 0 } } catch {}; exit 1" >nul 2>nul
+for /L %%I in (1,1,60) do (
+  powershell -NoProfile -Command "try { $r=Invoke-RestMethod 'http://127.0.0.1:8787/api/health' -TimeoutSec 1; if ($r.ok -eq $true) { Write-Output $r.version; exit 0 } } catch {}; exit 1" > "%TEMP%\mt_eps_factory_version.txt" 2>nul
   if not errorlevel 1 goto :ready
   timeout /t 1 /nobreak >nul
 )
 
-echo [ERROR] The local server did not become ready within 45 seconds.
+echo [ERROR] The local server did not become ready within 60 seconds.
 echo Check the minimized server window for the error message.
 pause
 exit /b 1
 
 :ready
-echo [OK] Server ready. Opening the app...
-start "" http://127.0.0.1:8787
+set /p MT_FACTORY_VERSION=<"%TEMP%\mt_eps_factory_version.txt"
+echo [OK] Server ready. Runtime version: %MT_FACTORY_VERSION%
+echo [OPEN] Opening a fresh browser URL so cached UI is bypassed...
+start "" "http://127.0.0.1:8787/?v=%MT_FACTORY_VERSION%&fresh=%RANDOM%%RANDOM%"
 exit /b 0
 
 :fail
