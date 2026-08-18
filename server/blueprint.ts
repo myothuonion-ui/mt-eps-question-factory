@@ -25,21 +25,16 @@ export function createBlueprint(analysis?: ImportAnalysis | null, includeImporte
     const imported = includeImportedQuestions && source
       ? { ...source, patternId, origin: source.origin ?? 'imported' as const, reviewState: source.reviewState ?? 'not_reviewed' as const, revision: source.revision ?? 1 }
       : null;
-    return {
-      slot,
-      section,
-      patternId,
-      expectedType,
-      question: imported,
-      generationRequired: !imported
-    } satisfies ExamSlot;
+    return { slot, section, patternId, expectedType, question: imported, generationRequired: !imported } satisfies ExamSlot;
   });
 }
 
-function chapterForSlot(slot: number, questions: NormalizedQuestion[]) {
-  const sourceChapter = questions.find(question => question.sourceOrder === slot)?.chapter.chapter;
+function chapterForSlot(slot: number, analysis: ImportAnalysis) {
+  const selected = (analysis.generationChapters ?? []).filter(chapter => Number.isInteger(chapter) && chapter >= 1 && chapter <= 60);
+  if (selected.length) return selected[(slot - 1) % selected.length];
+  const sourceChapter = analysis.questions.find(question => question.sourceOrder === slot)?.chapter.chapter;
   if (sourceChapter) return sourceChapter;
-  const known = questions.map(question => question.chapter.chapter).filter((value): value is number => !!value);
+  const known = analysis.questions.map(question => question.chapter.chapter).filter((value): value is number => !!value);
   if (known.length) return known[(slot - 1) % known.length];
   return ((slot - 1) % 60) + 1;
 }
@@ -55,11 +50,9 @@ function examplesFor(slot: ExamSlot, questions: NormalizedQuestion[]) {
 }
 
 export async function complete40QuestionSet(analysis: ImportAnalysis, name?: string): Promise<ExamSet> {
-  // Imported questions are references/pattern examples. The finished set is freshly generated.
-  // This avoids simply copying a 40-question Google Form into the output set.
   const slots = createBlueprint(analysis, false);
   for (const slot of slots) {
-    const chapter = chapterForSlot(slot.slot, analysis.questions);
+    const chapter = chapterForSlot(slot.slot, analysis);
     const question = await generateQuestion({
       slot: slot.slot,
       section: slot.section,
@@ -69,8 +62,6 @@ export async function complete40QuestionSet(analysis: ImportAnalysis, name?: str
       sourceExamples: examplesFor(slot, analysis.questions)
     });
 
-    // Preserve source media references so listening questions can reuse the teacher's
-    // YouTube/audio/video source during the automatic listening finalization phase.
     const reference = analysis.questions.find(item => item.sourceOrder === slot.slot);
     if (slot.section === 'listening' && reference?.media?.length) {
       question.media = reference.media.filter(item => item.kind === 'youtube' || item.kind === 'audio' || item.kind === 'video');

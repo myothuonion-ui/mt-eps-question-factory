@@ -71,6 +71,7 @@ export type ImportAnalysis = {
   sourceTitle: string;
   importedAt: string;
   mediaPool?: MediaRef[];
+  generationChapters?: number[];
   counts: {
     questions: number;
     listening: number;
