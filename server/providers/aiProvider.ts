@@ -9,6 +9,8 @@ export type GenerationSpec = {
   patternId: string;
   chapter: number;
   sourceExamples?: NormalizedQuestion[];
+  listeningContext?: string | null;
+  mediaConstrained?: boolean;
   preserveQuestion?: NormalizedQuestion | null;
   mode?: 'entire' | 'choices' | 'explanation' | 'script';
 };
@@ -38,6 +40,13 @@ function promptFor(spec: GenerationSpec) {
     options: q.options,
     answer: q.correctAnswerIndex
   }));
+  const listeningRules = spec.section === 'listening'
+    ? spec.listeningContext?.trim()
+      ? `\nIMPORTANT LISTENING GROUNDING:\nThe final question MUST be answerable from this source audio transcript/segment and must not invent facts that are absent from it. Preserve its factual content while writing an original EPS-TOPIK-style question.\nSOURCE AUDIO CONTEXT:\n${spec.listeningContext.slice(0, 10000)}\nFor source-audio questions, listeningScript may summarize the actual source dialogue but the attached original audio remains the authoritative listening asset.`
+      : spec.mediaConstrained
+        ? `\nIMPORTANT LISTENING GROUNDING:\nAn original teacher-owned audio/video source is attached, but a transcript is not available. Keep the factual meaning of the exact first source example conservative: paraphrase its question/options rather than inventing a new situation, so the result remains answerable from the same audio. Do not change the correct underlying fact.`
+        : ''
+    : '';
   return `You are producing one original EPS-TOPIK Korean exam practice question for a teacher's private question factory.
 Return JSON only.
 Slot: ${spec.slot}
@@ -49,11 +58,12 @@ Requirements:
 - Natural Korean appropriate for EPS-TOPIK learners.
 - Exactly 4 options.
 - Exactly one unambiguous correct answer, correctAnswerIndex is 0-3.
-- Do not copy source wording; use examples only to learn structure/difficulty.
+- Do not copy source wording; use examples to learn structure, facts when media-constrained, and difficulty.
 - explanation should be concise Burmese with key Korean reasoning.
-- If listening, include listeningScript as an array of {speaker:"narrator"|"male"|"female",text:string}. Keep it concise and natural.
+- If listening and there is no original source-audio grounding, include listeningScript as an array of {speaker:"narrator"|"male"|"female",text:string}.
+- If listening is grounded in an original source audio transcript, the question and answer must match that transcript exactly in meaning.
 - If not listening, listeningScript may be omitted.
-- No markdown.
+- No markdown.${listeningRules}
 Source pattern examples: ${JSON.stringify(examples)}
 Existing question to preserve/modify when requested: ${JSON.stringify(spec.preserveQuestion ?? null)}
 Requested regeneration mode: ${spec.mode ?? 'entire'}
@@ -64,9 +74,7 @@ function validatePayload(raw: unknown): AiQuestionPayload {
   if (!raw || typeof raw !== 'object') throw new Error('AI payload is not an object.');
   const value = raw as Record<string, unknown>;
   if (typeof value.stem !== 'string' || !value.stem.trim()) throw new Error('AI payload is missing a question stem.');
-  if (!Array.isArray(value.options) || value.options.length !== 4 || value.options.some(item => typeof item !== 'string')) {
-    throw new Error('AI payload must contain exactly four string options.');
-  }
+  if (!Array.isArray(value.options) || value.options.length !== 4 || value.options.some(item => typeof item !== 'string')) throw new Error('AI payload must contain exactly four string options.');
   const answer = Number(value.correctAnswerIndex);
   if (!Number.isInteger(answer) || answer < 0 || answer > 3) throw new Error('AI payload correctAnswerIndex must be 0-3.');
   const script = Array.isArray(value.listeningScript)
@@ -91,14 +99,8 @@ async function generateOpenAiCompatible(spec: GenerationSpec): Promise<AiQuestio
   const model = process.env.AI_MODEL ?? '';
   if (!base || !key || !model) throw new Error('AI_BASE_URL, AI_API_KEY and AI_MODEL are required.');
   const response = await fetch(`${base}/chat/completions`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
-    body: JSON.stringify({
-      model,
-      temperature: 0.65,
-      response_format: { type: 'json_object' },
-      messages: [{ role: 'user', content: promptFor(spec) }]
-    })
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
+    body: JSON.stringify({ model, temperature: 0.65, response_format: { type: 'json_object' }, messages: [{ role: 'user', content: promptFor(spec) }] })
   });
   if (!response.ok) throw new Error(`AI provider failed: HTTP ${response.status} ${await response.text()}`);
   const json = await response.json() as any;
@@ -112,12 +114,8 @@ async function generateGemini(spec: GenerationSpec): Promise<AiQuestionPayload> 
   const model = process.env.GEMINI_MODEL ?? 'gemini-2.5-flash';
   if (!key) throw new Error('GEMINI_API_KEY is required.');
   const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: promptFor(spec) }] }],
-      generationConfig: { temperature: 0.65, responseMimeType: 'application/json' }
-    })
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ contents: [{ parts: [{ text: promptFor(spec) }] }], generationConfig: { temperature: 0.65, responseMimeType: 'application/json' } })
   });
   if (!response.ok) throw new Error(`Gemini failed: HTTP ${response.status} ${await response.text()}`);
   const json = await response.json() as any;
@@ -142,18 +140,11 @@ function mockPayload(spec: GenerationSpec): AiQuestionPayload {
   };
 }
 
-export function activeAiProviderName() {
-  return (process.env.AI_PROVIDER ?? 'mock').toLowerCase();
-}
+export function activeAiProviderName() { return (process.env.AI_PROVIDER ?? 'mock').toLowerCase(); }
 
 export async function generateQuestion(spec: GenerationSpec): Promise<NormalizedQuestion> {
   const provider = activeAiProviderName();
-  const payload = provider === 'gemini'
-    ? await generateGemini(spec)
-    : provider === 'openai-compatible'
-      ? await generateOpenAiCompatible(spec)
-      : mockPayload(spec);
-
+  const payload = provider === 'gemini' ? await generateGemini(spec) : provider === 'openai-compatible' ? await generateOpenAiCompatible(spec) : mockPayload(spec);
   const preserved = spec.preserveQuestion;
   const next = spec.mode === 'choices' && preserved
     ? { ...preserved, options: payload.options, correctAnswerIndex: payload.correctAnswerIndex, explanation: payload.explanation ?? preserved.explanation }
@@ -162,35 +153,13 @@ export async function generateQuestion(spec: GenerationSpec): Promise<Normalized
       : spec.mode === 'script' && preserved
         ? { ...preserved, listeningScript: payload.listeningScript }
         : {
-            id: preserved?.id ?? `GEN-${randomUUID()}`,
-            sourceOrder: spec.slot,
-            stem: payload.stem,
-            options: payload.options,
-            correctAnswerIndex: payload.correctAnswerIndex,
-            explanation: payload.explanation ?? null,
-            type: spec.expectedType,
-            chapter: {
-              chapter: spec.chapter,
-              title: CHAPTERS[spec.chapter - 1] ?? null,
-              confidence: 1,
-              reason: 'Generator target chapter'
-            },
-            patternId: spec.patternId,
-            media: [],
-            listeningScript: payload.listeningScript,
-            audioAsset: null,
-            qaFlags: [],
-            origin: 'generated' as const,
-            generatedBy: provider,
-            revision: preserved?.revision ?? 1,
-            reviewState: 'not_reviewed' as const,
-            provenance: {
-              sourceUrl: 'local://generated',
-              sourceTitle: 'MT EPS Question Factory',
-              sourceQuestionId: preserved?.id ?? null
-            }
+            id: preserved?.id ?? `GEN-${randomUUID()}`, sourceOrder: spec.slot, stem: payload.stem, options: payload.options,
+            correctAnswerIndex: payload.correctAnswerIndex, explanation: payload.explanation ?? null, type: spec.expectedType,
+            chapter: { chapter: spec.chapter, title: CHAPTERS[spec.chapter - 1] ?? null, confidence: 1, reason: 'Generator target chapter' },
+            patternId: spec.patternId, media: [], listeningScript: payload.listeningScript, audioAsset: null, qaFlags: [], origin: 'generated' as const,
+            generatedBy: provider, revision: preserved?.revision ?? 1, reviewState: 'not_reviewed' as const,
+            provenance: { sourceUrl: 'local://generated', sourceTitle: 'MT EPS Question Factory', sourceQuestionId: preserved?.id ?? null }
           };
-
   return {
     ...next,
     id: next.id ?? `GEN-${randomUUID()}`,
@@ -200,9 +169,8 @@ export async function generateQuestion(spec: GenerationSpec): Promise<Normalized
     chapter: next.chapter ?? { chapter: spec.chapter, title: CHAPTERS[spec.chapter - 1] ?? null, confidence: 1, reason: 'Generator target chapter' },
     media: next.media ?? [],
     qaFlags: [...new Set([...(next.qaFlags ?? []), ...(provider === 'mock' ? ['MOCK_PROVIDER'] : [])])],
-    origin: next.origin ?? 'generated',
-    generatedBy: provider,
-    revision: (preserved?.revision ?? 0) + (preserved ? 1 : 1),
+    origin: next.origin ?? 'generated', generatedBy: provider,
+    revision: (preserved?.revision ?? 0) + 1,
     reviewState: preserved?.reviewState ?? 'not_reviewed',
     provenance: next.provenance ?? { sourceUrl: 'local://generated', sourceTitle: 'MT EPS Question Factory' }
   } as NormalizedQuestion;
