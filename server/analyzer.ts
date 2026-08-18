@@ -12,7 +12,7 @@ const chapterHints: Record<number, string[]> = {
 
 export function classifyType(stem: string, optionText: string, hasYoutube: boolean, hasImage: boolean): QuestionType {
   const text = `${stem} ${optionText}`;
-  if (hasYoutube || /듣고|들은|대화를 듣/.test(text)) return 'listening';
+  if (hasYoutube || /듣고|들은|듣기|듣습니다|말을\s*듣|대화를\s*듣|음성을\s*듣|다음을\s*듣|이야기를\s*듣|남자.*여자|여자.*남자/.test(text)) return 'listening';
   if (/\[\s*[_\-–—]+\s*\]|빈칸|빈 곳|알맞은 것을 고르/.test(text) && /[_\-–—]{2,}/.test(text)) return 'blank';
   if (/문법|어미|조사|표현/.test(text)) return 'grammar';
   if (/단어|어휘|뜻|의미/.test(text)) return 'vocabulary';
