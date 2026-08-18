@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { ExamSet, ExamSlot, ImportAnalysis, NormalizedQuestion, QuestionType } from '../src/shared/types.js';
 import { generateQuestion } from './providers/aiProvider.js';
-import { finalizeListeningSlots } from './listeningPipeline.js';
+import { finalizeListeningSlots, prepareListeningReference } from './listeningPipeline.js';
 import { runQaForSet } from './qa.js';
 
 function defaultReadingType(slot: number): QuestionType {
@@ -53,21 +53,28 @@ export async function complete40QuestionSet(analysis: ImportAnalysis, name?: str
   const slots = createBlueprint(analysis, false);
   for (const slot of slots) {
     const chapter = chapterForSlot(slot.slot, analysis);
+    const reference = analysis.questions.find(item => item.sourceOrder === slot.slot);
+    const hasOwnedMedia = slot.section === 'listening' && !!reference?.media?.some(item => item.kind === 'youtube' || item.kind === 'audio' || item.kind === 'video');
+    const prepared = hasOwnedMedia && reference ? await prepareListeningReference(reference) : null;
+
     const question = await generateQuestion({
       slot: slot.slot,
       section: slot.section,
       expectedType: slot.expectedType,
       patternId: slot.patternId,
       chapter,
-      sourceExamples: examplesFor(slot, analysis.questions)
+      sourceExamples: examplesFor(slot, analysis.questions),
+      listeningContext: prepared?.transcript ?? null,
+      mediaConstrained: hasOwnedMedia
     });
 
-    const reference = analysis.questions.find(item => item.sourceOrder === slot.slot);
     if (slot.section === 'listening' && reference?.media?.length) {
       question.media = reference.media.filter(item => item.kind === 'youtube' || item.kind === 'audio' || item.kind === 'video');
       question.provenance.sourceQuestionId = reference.id;
       question.provenance.sourceUrl = reference.provenance.sourceUrl;
       question.provenance.sourceTitle = reference.provenance.sourceTitle;
+      if (prepared?.audioAsset) question.audioAsset = prepared.audioAsset;
+      if (prepared?.flags.length) question.qaFlags = [...new Set([...question.qaFlags, ...prepared.flags])];
     }
 
     slot.question = question;
