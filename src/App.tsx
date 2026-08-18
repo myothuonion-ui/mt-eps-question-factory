@@ -16,15 +16,17 @@ export function App() {
   const [set40, setSet40] = useState<ExamSet | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [reviewOpen, setReviewOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
 
-  const reviewCount = useMemo(() => analysis?.questions.filter(q => q.qaFlags.length > 0).length ?? 0, [analysis]);
+  const qaFlagCount = useMemo(() => analysis?.questions.filter(q => q.qaFlags.length > 0).length ?? 0, [analysis]);
 
   async function analyze() {
     setLoading(true);
     setError('');
     setAnalysis(null);
     setSet40(null);
+    setReviewOpen(false);
     try {
       const response = await fetch('/api/import/google-form', {
         method: 'POST',
@@ -45,6 +47,7 @@ export function App() {
     if (!analysis) return;
     setLoading(true);
     setError('');
+    setReviewOpen(false);
     try {
       const response = await fetch('/api/exam/build-40', {
         method: 'POST',
@@ -91,15 +94,15 @@ export function App() {
           <span>06 QA</span>
           <span>07 Review · Optional</span>
         </nav>
-        <div className="sidebar-note">Review never blocks the full 40-question build.</div>
+        <div className="sidebar-note">The factory finishes all 40 first. Review is optional afterwards.</div>
       </aside>
 
       <section className="workspace">
         <header className="hero">
           <div>
             <span className="eyebrow">STAGE 1 · v0.1.0</span>
-            <h2>Google Form → analyzed question bank</h2>
-            <p>Paste a Google Forms viewscore/result link. The factory extracts question structure, answer evidence, media, YouTube references, type and Chapter 1–60 hints.</p>
+            <h2>Google Form → analyzed 40Q pipeline</h2>
+            <p>Paste a Google Forms viewscore/result link. The factory extracts question structure, answer evidence, media, YouTube references, type and Chapter 1–60 hints. QA flags never stop the build.</p>
           </div>
           <div className="status-pill">Standalone project</div>
         </header>
@@ -142,8 +145,8 @@ export function App() {
               </div>
               <div className="analysis-toolbar">
                 <div><strong>{analysis.questions.length}</strong> normalized questions</div>
-                <div><strong>{reviewCount}</strong> QA flags · review later if you want</div>
-                <button className="secondary" onClick={build40} disabled={loading}>Build 40Q Structure</button>
+                <div><strong>{qaFlagCount}</strong> QA flags recorded · no blocking</div>
+                <button className="secondary" onClick={build40} disabled={loading}>Continue to 40Q</button>
               </div>
               <div className="question-grid">
                 {analysis.questions.map(question => (
@@ -155,24 +158,15 @@ export function App() {
                         Ch {question.chapter.chapter ?? '?'} · {Math.round(question.chapter.confidence * 100)}%
                       </span>
                     </div>
-                    {editingId === question.id ? (
-                      <QuestionEditor question={question} onChange={patch => updateQuestion(question.id, patch)} />
-                    ) : (
-                      <>
-                        <h4>{question.stem}</h4>
-                        <ol>
-                          {question.options.map((option, i) => <li className={question.correctAnswerIndex === i ? 'correct' : ''} key={`${question.id}-${i}`}>{option}</li>)}
-                        </ol>
-                      </>
-                    )}
+                    <h4>{question.stem}</h4>
+                    <ol>
+                      {question.options.map((option, i) => <li className={question.correctAnswerIndex === i ? 'correct' : ''} key={`${question.id}-${i}`}>{option}</li>)}
+                    </ol>
                     <div className="card-footer">
                       <div className="tags">
                         {question.media.map((m, i) => <span key={`${m.kind}-${i}`}>{m.kind}</span>)}
                         {question.qaFlags.map(flag => <span className="warn" key={flag}>{flag}</span>)}
                       </div>
-                      <button className="text-button" onClick={() => setEditingId(editingId === question.id ? null : question.id)}>
-                        {editingId === question.id ? 'Done' : 'Edit'}
-                      </button>
                     </div>
                   </article>
                 ))}
@@ -187,7 +181,7 @@ export function App() {
               <div><span className="step">04</span><h3>40Q Set</h3></div>
               <span className={set40.complete ? 'complete-badge' : 'pending-badge'}>{set40.complete ? '40 / 40 complete' : `${set40.slots.filter(s => s.question).length} / 40 imported`}</span>
             </div>
-            <p className="review-policy">The pipeline does not stop for review. Missing slots are marked for later AI generation. Once all 40 are complete, you can use the set immediately or open optional review and edit any single question/audio.</p>
+            <p className="review-policy">No review gate. The next generator stage will automatically fill missing slots, then Listening + QA will finish the set. Only after 40/40 is complete will optional review be offered.</p>
             <div className="slot-grid">
               {set40.slots.map(slot => (
                 <div className={`slot ${slot.question ? 'filled' : 'missing'}`} key={slot.slot}>
@@ -195,6 +189,40 @@ export function App() {
                   <span>{slot.section}</span>
                   <small>{slot.question ? slot.question.type : 'generation required'}</small>
                 </div>
+              ))}
+            </div>
+            {set40.complete && (
+              <div className="analysis-toolbar review-launcher">
+                <div><strong>40/40 finished.</strong> Use now, or open review only if you want to change something.</div>
+                <button className="secondary" onClick={() => setReviewOpen(value => !value)}>{reviewOpen ? 'Close Review' : 'Open Optional Review'}</button>
+              </div>
+            )}
+          </section>
+        )}
+
+        {set40?.complete && reviewOpen && (
+          <section className="panel">
+            <div className="panel-heading">
+              <div><span className="step">07</span><h3>Optional Review</h3></div>
+              <span className="subtle">Edit only what you want. No forced approval step.</span>
+            </div>
+            <div className="question-grid">
+              {set40.slots.map(slot => slot.question && (
+                <article className="question-card" key={`review-${slot.question.id}`}>
+                  <div className="question-meta"><span>Q{String(slot.slot).padStart(2, '0')}</span><span>{slot.section}</span><span>{slot.question.type}</span></div>
+                  {editingId === slot.question.id ? (
+                    <QuestionEditor question={slot.question} onChange={patch => updateQuestion(slot.question!.id, patch)} />
+                  ) : (
+                    <>
+                      <h4>{slot.question.stem}</h4>
+                      <ol>{slot.question.options.map((option, i) => <li className={slot.question!.correctAnswerIndex === i ? 'correct' : ''} key={i}>{option}</li>)}</ol>
+                    </>
+                  )}
+                  <div className="card-footer">
+                    <div className="tags">{slot.question.qaFlags.map(flag => <span className="warn" key={flag}>{flag}</span>)}</div>
+                    <button className="text-button" onClick={() => setEditingId(editingId === slot.question!.id ? null : slot.question!.id)}>{editingId === slot.question.id ? 'Done' : 'Edit Question'}</button>
+                  </div>
+                </article>
               ))}
             </div>
           </section>
@@ -218,6 +246,7 @@ function QuestionEditor({ question, onChange }: { question: NormalizedQuestion; 
           }} />
         </div>
       ))}
+      <div className="source-types"><span>Regenerate question · Stage 3</span><span>Regenerate choices · Stage 3</span><span>Audio only · Listening Stage</span></div>
     </div>
   );
 }
