@@ -88,13 +88,19 @@ export async function listRevisions(setId: string, questionId: string) {
     .filter(item => item.setId === setId && item.questionId === questionId);
 }
 
-export async function publishSet(set: ExamSet) {
+export async function saveQuestionsToBank(questions: NormalizedQuestion[]) {
   const bank = await readCollection<NormalizedQuestion>('question-bank');
   const existing = new Map(bank.map(item => [item.id, item]));
-  for (const slot of set.slots) {
-    if (slot.question) existing.set(slot.question.id, { ...slot.question, reviewState: slot.question.reviewState ?? 'not_reviewed' });
+  for (const question of questions) {
+    existing.set(question.id, { ...question, reviewState: question.reviewState ?? 'not_reviewed' });
   }
-  await writeCollection('question-bank', [...existing.values()]);
+  const saved = [...existing.values()];
+  await writeCollection('question-bank', saved);
+  return saved;
+}
+
+export async function publishSet(set: ExamSet) {
+  await saveQuestionsToBank(set.slots.flatMap(slot => slot.question ? [slot.question] : []));
   return saveSet({ ...set, published: true });
 }
 
