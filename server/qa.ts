@@ -35,13 +35,20 @@ export function runQaForSet(slots: ExamSlot[]) {
     if (!slot.question) return slot;
     const qa = basicQa(slot.question);
     const duplicate = populated.some(other => other.id !== slot.question!.id && similarity(`${slot.question!.stem} ${slot.question!.options.join(' ')}`, `${other.stem} ${other.options.join(' ')}`) >= 0.86);
-    const flags = [...qa.flags, ...(duplicate ? ['QA_POSSIBLE_DUPLICATE'] : [])];
+    const sectionMatch = slot.question.section === slot.section;
+    const sectionTypeMatch = slot.section === 'listening' ? slot.question.type === 'listening' : slot.question.type !== 'listening';
+    const sectionFlags = [
+      ...(!sectionMatch ? ['QA_SECTION_MISMATCH'] : []),
+      ...(!sectionTypeMatch ? ['QA_SECTION_TYPE_MISMATCH'] : [])
+    ];
+    const flags = [...qa.flags, ...(duplicate ? ['QA_POSSIBLE_DUPLICATE'] : []), ...sectionFlags];
+    const penalty = (duplicate ? 15 : 0) + (!sectionMatch ? 15 : 0) + (!sectionTypeMatch ? 15 : 0);
     const merged = {
       ...qa,
-      passed: qa.passed && !duplicate,
-      score: Math.max(0, qa.score - (duplicate ? 15 : 0)),
+      passed: qa.passed && !duplicate && sectionMatch && sectionTypeMatch,
+      score: Math.max(0, qa.score - penalty),
       flags,
-      checks: { ...qa.checks, duplicateFree: !duplicate }
+      checks: { ...qa.checks, duplicateFree: !duplicate, sectionMatch, sectionTypeMatch }
     };
     return {
       ...slot,
