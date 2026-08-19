@@ -2,6 +2,15 @@ import { randomUUID } from 'node:crypto';
 import { CHAPTERS } from '../../src/shared/chapters.js';
 import type { ListeningScriptLine, NormalizedQuestion, QuestionType } from '../../src/shared/types.js';
 import { getProviderSettings } from '../providerSettings.js';
+import {
+  clearRateLimit,
+  earliestCooldownMs,
+  isRateLimitError,
+  providerCooldownMs,
+  registerRateLimit,
+  waitForCooldown,
+  waitForProviderSlot
+} from './requestQueue.js';
 
 export type GenerationSpec = {
   slot: number;
@@ -33,6 +42,7 @@ type AiQuestionPayload = {
 };
 
 type ProviderName = 'gemini' | 'glm' | 'mock';
+type RealProviderName = Exclude<ProviderName, 'mock'>;
 
 function jsonValue(text: string) {
   const cleaned = text.replace(/```(?:json)?/gi, '').replace(/```/g, '').trim();
@@ -123,6 +133,27 @@ function validateBatch(raw: unknown, specs: GenerationSpec[]) {
   return specs.map((spec, index) => bySlot.get(spec.slot) ?? payloads[index]);
 }
 
+function retryAfterFromResponse(response: Response, body: string) {
+  const raw = response.headers.get('retry-after');
+  if (raw) {
+    const seconds = Number(raw);
+    if (Number.isFinite(seconds) && seconds > 0) return seconds * 1000;
+    const date = Date.parse(raw);
+    if (Number.isFinite(date) && date > Date.now()) return date - Date.now();
+  }
+  const match = body.match(/"retryDelay"\s*:\s*"([0-9]+(?:\.[0-9]+)?)s"/i)
+    ?? body.match(/retry(?:Delay|[_ -]?after| in)[^0-9]{0,20}([0-9]+(?:\.[0-9]+)?)\s*s/i);
+  return match ? Math.ceil(Number(match[1]) * 1000) : 0;
+}
+
+function providerHttpError(provider: string, response: Response, body: string) {
+  const error = new Error(`${provider} failed: HTTP ${response.status} ${body}`);
+  (error as any).status = response.status;
+  const retryAfter = retryAfterFromResponse(response, body);
+  if (retryAfter > 0) (error as any).retryAfterMs = retryAfter;
+  return error;
+}
+
 async function callGemini(specs: GenerationSpec[]) {
   const settings = getProviderSettings();
   const key = process.env.GEMINI_API_KEY ?? '';
@@ -137,9 +168,7 @@ async function callGemini(specs: GenerationSpec[]) {
   });
   if (!response.ok) {
     const text = await response.text();
-    const error = new Error(`Gemini failed: HTTP ${response.status} ${text}`);
-    (error as any).status = response.status;
-    throw error;
+    throw providerHttpError('Gemini', response, text);
   }
   const json = await response.json() as any;
   const text = json?.candidates?.[0]?.content?.parts?.map((part: any) => part?.text ?? '').join('');
@@ -163,9 +192,7 @@ async function callGlm(specs: GenerationSpec[]) {
   });
   if (!response.ok) {
     const text = await response.text();
-    const error = new Error(`GLM failed: HTTP ${response.status} ${text}`);
-    (error as any).status = response.status;
-    throw error;
+    throw providerHttpError('GLM', response, text);
   }
   const json = await response.json() as any;
   const text = json?.choices?.[0]?.message?.content;
@@ -215,7 +242,8 @@ async function callProvider(provider: ProviderName, specs: GenerationSpec[]) {
 
 function shortError(error: unknown) {
   const text = error instanceof Error ? error.message : String(error);
-  if (/Gemini failed: HTTP 429/.test(text)) return 'Gemini quota/rate limit reached (HTTP 429).';
+  if (/Gemini failed: HTTP 429/i.test(text)) return 'Gemini is temporarily rate-limited (HTTP 429).';
+  if (/GLM failed: HTTP 429|Too Many Requests/i.test(text)) return 'GLM is temporarily rate-limited (HTTP 429).';
   return text.length > 260 ? `${text.slice(0, 257)}...` : text;
 }
 
@@ -269,29 +297,103 @@ export function activeAiProviderName() {
   return settings.order.replace('gemini-glm', 'gemini→glm').replace('glm-gemini', 'glm→gemini');
 }
 
+function maxRateLimitWaitMs() {
+  const value = Number(process.env.AI_RATE_LIMIT_MAX_WAIT_MS ?? 12 * 60_000);
+  return Number.isFinite(value) ? Math.max(30_000, Math.min(60 * 60_000, Math.round(value))) : 12 * 60_000;
+}
+
 export async function generateQuestionBatch(specs: GenerationSpec[], onAttempt?: (event: ProviderAttemptEvent) => void) {
   const sequence = providerSequence();
-  let lastError: unknown = null;
-  for (let index = 0; index < sequence.length; index += 1) {
-    const provider = sequence[index];
-    if (!configured(provider)) {
-      onAttempt?.({ provider, fallback: index > 0, level: 'warn', message: `${provider.toUpperCase()} is not configured; skipping it.` });
-      continue;
-    }
-    try {
-      onAttempt?.({ provider, fallback: index > 0, level: 'info', message: `Using ${provider.toUpperCase()} for Q${specs[0].slot}–Q${specs[specs.length - 1].slot}.` });
-      const payloads = await callProvider(provider, specs);
-      return specs.map((spec, i) => toQuestion(spec, payloads[i], provider));
-    } catch (error) {
-      lastError = error;
-      const hasNext = sequence.slice(index + 1).some(configured);
-      onAttempt?.({ provider, fallback: hasNext, level: 'warn', message: `${shortError(error)}${hasNext ? ' Falling back automatically.' : ''}` });
-      if (!hasNext) break;
-    }
+  if (sequence.length === 1 && sequence[0] === 'mock') {
+    return specs.map(spec => toQuestion(spec, mockPayload(spec), 'mock'));
   }
-  const raw = shortError(lastError ?? new Error('No AI provider is configured.'));
-  if (/Gemini quota\/rate limit/.test(raw)) {
-    throw new Error(`${raw} Add a GLM key in 05 API & Tools for automatic fallback, or wait for Gemini quota reset.`);
+
+  const realProviders = sequence.filter((provider): provider is RealProviderName => provider !== 'mock' && configured(provider));
+  if (!realProviders.length) throw new Error('No AI provider is configured. Add Gemini or GLM in API Keys.');
+
+  const startedAt = Date.now();
+  let lastError: unknown = null;
+  let cycle = 0;
+
+  while (Date.now() - startedAt < maxRateLimitWaitMs()) {
+    cycle += 1;
+    let sawRateLimit = false;
+    let attemptedProvider = false;
+
+    for (let index = 0; index < sequence.length; index += 1) {
+      const provider = sequence[index];
+      if (provider === 'mock') continue;
+      if (!configured(provider)) {
+        onAttempt?.({ provider, fallback: index > 0, level: 'warn', message: `${provider.toUpperCase()} is not configured; skipping it.` });
+        continue;
+      }
+
+      const cooldown = providerCooldownMs(provider);
+      if (cooldown > 0) {
+        sawRateLimit = true;
+        onAttempt?.({
+          provider,
+          fallback: true,
+          level: 'info',
+          message: `${provider.toUpperCase()} is cooling down. Checking another provider first; ${Math.ceil(cooldown / 1000)}s remain.`
+        });
+        continue;
+      }
+
+      attemptedProvider = true;
+      try {
+        await waitForProviderSlot(provider, (seconds, reason) => {
+          onAttempt?.({
+            provider,
+            fallback: index > 0,
+            level: 'info',
+            message: `Queue · ${reason}. Waiting ${seconds}s before Q${specs[0].slot}–Q${specs[specs.length - 1].slot}.`
+          });
+        });
+        onAttempt?.({ provider, fallback: index > 0, level: 'info', message: `Using ${provider.toUpperCase()} for Q${specs[0].slot}–Q${specs[specs.length - 1].slot}.` });
+        const payloads = await callProvider(provider, specs);
+        clearRateLimit(provider);
+        return specs.map((spec, i) => toQuestion(spec, payloads[i], provider));
+      } catch (error) {
+        lastError = error;
+        if (isRateLimitError(error)) {
+          sawRateLimit = true;
+          const cooldownMs = registerRateLimit(provider, error);
+          const hasOther = realProviders.some(other => other !== provider && providerCooldownMs(other) === 0);
+          onAttempt?.({
+            provider,
+            fallback: true,
+            level: 'warn',
+            message: `${shortError(error)} ${provider.toUpperCase()} paused for ${Math.ceil(cooldownMs / 1000)}s.${hasOther ? ' Trying the next provider now.' : ''}`
+          });
+          continue;
+        }
+
+        const hasNext = sequence.slice(index + 1).some(item => item !== 'mock' && configured(item));
+        onAttempt?.({ provider, fallback: hasNext, level: 'warn', message: `${shortError(error)}${hasNext ? ' Falling back automatically.' : ''}` });
+        if (!hasNext) throw error;
+      }
+    }
+
+    if (!sawRateLimit) break;
+
+    const waitMs = earliestCooldownMs(realProviders);
+    if (waitMs <= 0 && attemptedProvider) continue;
+    const elapsed = Date.now() - startedAt;
+    if (elapsed + waitMs > maxRateLimitWaitMs()) break;
+
+    onAttempt?.({
+      provider: 'queue',
+      fallback: true,
+      level: 'info',
+      message: `All configured AI providers are rate-limited. Job is paused, not failed. Retrying in ${Math.max(1, Math.ceil(waitMs / 1000))}s (queue cycle ${cycle}).`
+    });
+    await waitForCooldown(waitMs);
+  }
+
+  const raw = shortError(lastError ?? new Error('AI providers did not become available.'));
+  if (isRateLimitError(lastError)) {
+    throw new Error(`${raw} The job waited for provider cooldowns but the configured APIs stayed rate-limited. Retry later or use another API key/provider.`);
   }
   throw new Error(raw);
 }
