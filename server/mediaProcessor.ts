@@ -53,6 +53,83 @@ async function findNewest(prefix: string, extensionFilter?: string) {
   return path.join(MEDIA_DIR, stats[0].name);
 }
 
+function parseClock(value: string) {
+  const pieces = value.trim().replace(',', '.').split(':').map(Number);
+  if (pieces.some(piece => !Number.isFinite(piece))) return 0;
+  if (pieces.length === 3) return pieces[0] * 3600 + pieces[1] * 60 + pieces[2];
+  if (pieces.length === 2) return pieces[0] * 60 + pieces[1];
+  return pieces[0] ?? 0;
+}
+
+function stripVttText(value: string) {
+  return value
+    .replace(/<\d\d:\d\d(?::\d\d)?\.\d+>/g, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function parseVtt(vtt: string): MediaSegment[] {
+  const lines = vtt.replace(/\r/g, '').split('\n');
+  const segments: MediaSegment[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index].trim();
+    const match = line.match(/^([^\s]+)\s+-->\s+([^\s]+)/);
+    if (!match) continue;
+    const start = parseClock(match[1]);
+    const end = parseClock(match[2]);
+    const textLines: string[] = [];
+    let cursor = index + 1;
+    while (cursor < lines.length && lines[cursor].trim()) {
+      const clean = stripVttText(lines[cursor]);
+      if (clean) textLines.push(clean);
+      cursor += 1;
+    }
+    const text = stripVttText(textLines.join(' '));
+    if (end > start && text) {
+      const previous = segments[segments.length - 1];
+      if (previous && previous.text === text && Math.abs(previous.end - start) < 0.6) {
+        previous.end = end;
+      } else {
+        segments.push({ id: `SEG-${randomUUID()}`, start, end, text, speaker: null });
+      }
+    }
+    index = Math.max(index, cursor - 1);
+  }
+  return segments;
+}
+
+export async function extractYoutubeCaptions(rawUrl: string): Promise<MediaSegment[]> {
+  await fs.mkdir(MEDIA_DIR, { recursive: true });
+  const url = assertYoutubeUrl(rawUrl);
+  if (!await commandAvailable('yt-dlp')) return [];
+  const prefix = `captions-${Date.now()}-${randomUUID().slice(0, 6)}`;
+  const template = path.join(MEDIA_DIR, `${prefix}.%(ext)s`);
+  try {
+    await run('yt-dlp', [
+      '--no-playlist',
+      '--skip-download',
+      '--write-subs',
+      '--write-auto-subs',
+      '--sub-langs', 'ko.*,ko,en.*,en',
+      '--sub-format', 'vtt',
+      '-o', template,
+      url
+    ], 5 * 60_000);
+  } catch {
+    return [];
+  }
+  const subtitlePath = await findNewest(prefix, '.vtt');
+  if (!subtitlePath) return [];
+  try {
+    return parseVtt(await fs.readFile(subtitlePath, 'utf8'));
+  } catch {
+    return [];
+  }
+}
+
 export async function downloadYoutubeAudio(rawUrl: string) {
   await fs.mkdir(MEDIA_DIR, { recursive: true });
   const url = assertYoutubeUrl(rawUrl);

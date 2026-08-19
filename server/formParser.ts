@@ -121,7 +121,6 @@ function detectCorrectAnswer($: cheerio.CheerioAPI, el: any, options: string[]) 
     }
   }
 
-  // On score pages, a selected answer is authoritative when the item itself is marked full-score/correct.
   if (index === null) {
     const score = all.match(/(\d+(?:\.\d+)?)\s*(?:\/|of)\s*(\d+(?:\.\d+)?)(?:\s*points?)?/i);
     const correctWord = /\bCorrect\b|정답입니다|맞았습니다/i.test(all);
@@ -165,6 +164,54 @@ function findQuestionBlocks($: cheerio.CheerioAPI) {
   return { nodes: best?.nodes ?? [], selector: best?.selector ?? 'none', counts };
 }
 
+function quotedStrings(raw: string) {
+  const out: string[] = [];
+  for (const match of raw.matchAll(/"((?:\\.|[^"\\])*)"/g)) {
+    try {
+      const value = clean(JSON.parse(`"${match[1]}"`));
+      if (value) out.push(value);
+    } catch {}
+  }
+  return out;
+}
+
+function usefulParamString(value: string) {
+  if (!value || value.length > 600) return false;
+  if (/^(entry\.|https?:|mailto:|video\/|image\/|application\/)/i.test(value)) return false;
+  if (/^[\d._-]{8,}$/.test(value)) return false;
+  if (/^(required|other|correct|incorrect|answer|정답|오답)$/i.test(value)) return false;
+  return /[가-힣A-Za-z]/.test(value);
+}
+
+function dataParamRecovery($: cheerio.CheerioAPI) {
+  const recovered: Array<{ stem: string; options: string[]; media: MediaRef[] }> = [];
+  const seen = new Set<string>();
+  $('[data-params]').each((_, node) => {
+    const raw = $(node).attr('data-params') ?? '';
+    if (raw.length < 30) return;
+    const strings = quotedStrings(raw).filter(usefulParamString);
+    if (strings.length < 5) return;
+    let stemIndex = strings.findIndex(value => value.length >= 2 && value.length <= 350 && /[가-힣?]|고르|알맞|무엇|어디|언제|누구|내용|빈칸|그림|사진|듣/i.test(value));
+    if (stemIndex < 0) stemIndex = strings.findIndex(value => value.length >= 4 && value.length <= 350);
+    if (stemIndex < 0) return;
+    const stem = strings[stemIndex].replace(/^\s*\d+[.)]\s*/, '');
+    const options = strings
+      .slice(stemIndex + 1)
+      .filter(value => value !== stem && value.length <= 220)
+      .filter((value, index, arr) => arr.indexOf(value) === index)
+      .slice(0, 4);
+    if (options.length !== 4) return;
+    const key = `${stem.toLowerCase()}|${options.join('|').toLowerCase()}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    const media: MediaRef[] = [];
+    const yt = canonicalYoutube(raw);
+    if (yt) media.push({ kind: 'youtube', url: yt });
+    recovered.push({ stem, options, media });
+  });
+  return recovered;
+}
+
 function globalYoutubeUrls($: cheerio.CheerioAPI, html: string) {
   const urls = new Set<string>();
   $('iframe[src], a[href]').each((_, node) => {
@@ -187,7 +234,7 @@ export async function importGoogleFormViewScore(sourceUrl: string): Promise<Impo
   const response = await fetch(sourceUrl, {
     redirect: 'follow',
     headers: {
-      'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 MT-EPS-Question-Factory/0.3',
+      'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 MT-EPS-Question-Factory/0.4',
       'accept-language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7'
     }
   });
@@ -200,25 +247,18 @@ export async function importGoogleFormViewScore(sourceUrl: string): Promise<Impo
   const questions: NormalizedQuestion[] = [];
   const seen = new Set<string>();
 
-  found.nodes.forEach(block => {
-    const stem = questionStem($, block);
-    if (!stem || stem.length < 2) return;
-    const options = optionCandidates($, block).filter(option => option !== stem).slice(0, 4);
+  function appendQuestion(stem: string, options: string[], media: MediaRef[], answer: { index: number | null; evidence: string | null }, extraFlags: string[] = []) {
     const fingerprint = `${stem.toLowerCase()}|${options.join('|').toLowerCase()}`;
-    if (seen.has(fingerprint)) return;
+    if (seen.has(fingerprint)) return false;
     seen.add(fingerprint);
-
-    const media = collectMedia($, block);
-    const answer = detectCorrectAnswer($, block, options);
     const combined = `${stem} ${options.join(' ')}`;
     const type = classifyType(stem, options.join(' '), media.some(m => m.kind === 'youtube'), media.some(m => m.kind === 'image'));
     const chapter = classifyChapter(combined);
-    const qaFlags: string[] = [];
+    const qaFlags = [...extraFlags];
     if (options.length !== 4) qaFlags.push(`OPTIONS_${options.length}`);
     if (answer.index === null) qaFlags.push('ANSWER_NOT_DETECTED');
     if (chapter.chapter === null || chapter.confidence < 0.6) qaFlags.push('CHAPTER_LOW_CONFIDENCE');
     if (type === 'unknown') qaFlags.push('TYPE_LOW_CONFIDENCE');
-
     const sourceOrder = questions.length + 1;
     questions.push({
       id: stableId(sourceUrl, sourceOrder, stem),
@@ -230,10 +270,28 @@ export async function importGoogleFormViewScore(sourceUrl: string): Promise<Impo
       type,
       chapter,
       media,
-      qaFlags,
+      qaFlags: [...new Set(qaFlags)],
       provenance: { sourceUrl, sourceTitle }
     });
+    return true;
+  }
+
+  found.nodes.forEach(block => {
+    const stem = questionStem($, block);
+    if (!stem || stem.length < 2) return;
+    const options = optionCandidates($, block).filter(option => option !== stem).slice(0, 4);
+    const media = collectMedia($, block);
+    const answer = detectCorrectAnswer($, block, options);
+    appendQuestion(stem, options, media, answer);
   });
+
+  let recoveredCount = 0;
+  if (questions.length < 40) {
+    for (const recovered of dataParamRecovery($)) {
+      if (questions.length >= 40) break;
+      if (appendQuestion(recovered.stem, recovered.options, recovered.media, { index: null, evidence: null }, ['RECOVERED_FROM_DATA_PARAMS'])) recoveredCount += 1;
+    }
+  }
 
   const youtubeUrls = globalYoutubeUrls($, html);
   const globalImages = new Set<string>();
@@ -242,8 +300,6 @@ export async function importGoogleFormViewScore(sourceUrl: string): Promise<Impo
     if (src && !/googleusercontent\.com\/favicon|gstatic\.com\/forms/i.test(src)) globalImages.add(src);
   });
 
-  // EPS 40Q score forms commonly place shared YouTube players outside individual question blocks.
-  // When that structure is detected, map the shared players across the first 20 listening slots.
   let inferredListening = false;
   if (youtubeUrls.length > 0 && questions.length >= 35 && questions.filter(q => q.type === 'listening').length < 5) {
     inferredListening = true;
@@ -264,15 +320,17 @@ export async function importGoogleFormViewScore(sourceUrl: string): Promise<Impo
   const optionHistogram: Record<string, number> = {};
   for (const question of questions) optionHistogram[String(question.options.length)] = (optionHistogram[String(question.options.length)] ?? 0) + 1;
   const warnings: string[] = [];
-  if (questions.length !== 40) warnings.push(`Detected ${questions.length} question blocks, not 40. Check extracted references before generation.`);
+  if (questions.length !== 40) warnings.push(`Detected ${questions.length} question blocks, not 40. The one-click builder will still finish 40 fresh questions, but source coverage is incomplete.`);
   if (questions.filter(q => q.options.length === 4).length !== questions.length) warnings.push('Some detected blocks do not have exactly four choices.');
   if (questions.filter(q => q.correctAnswerIndex !== null).length < questions.length) warnings.push('Some correct answers could not be proven from the score page and are flagged instead of guessed.');
+  if (recoveredCount) warnings.push(`Recovered ${recoveredCount} additional question(s) from Google Forms structured data-params.`);
   if (inferredListening) warnings.push('Shared YouTube sources were mapped across the first 20 EPS listening slots because the players are outside individual question blocks.');
 
+  const candidateBlockCounts = { ...found.counts, 'data-params-recovery': recoveredCount };
   const diagnostics: AnalysisDiagnostics = {
-    parserStrategy: `${found.selector}${inferredListening ? ' + EPS shared-YouTube mapping' : ''}`,
-    candidateBlockCounts: found.counts,
-    selectedBlockCount: found.nodes.length,
+    parserStrategy: `${found.selector}${recoveredCount ? ' + data-params recovery' : ''}${inferredListening ? ' + EPS shared-YouTube mapping' : ''}`,
+    candidateBlockCounts,
+    selectedBlockCount: questions.length,
     rawHtmlBytes: Buffer.byteLength(html, 'utf8'),
     optionHistogram,
     globalYoutube: youtubeUrls.length,
