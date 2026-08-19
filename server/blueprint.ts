@@ -3,6 +3,7 @@ import type { ExamSection, ExamSet, ExamSlot, ImportAnalysis, NormalizedQuestion
 import { generateQuestionBatch, type GenerationSpec } from './providers/aiProvider.js';
 import { finalizeListeningSlots, prepareListeningReferences } from './listeningPipeline.js';
 import { runQaForSet } from './qa.js';
+import { runSemanticQaAgent } from './agents/semanticQaAgent.js';
 import { getProviderSettings } from './providerSettings.js';
 import type { ProgressEvent } from './jobManager.js';
 
@@ -188,21 +189,29 @@ export async function complete40QuestionSet(analysis: ImportAnalysis, name?: str
   let audioProgress = 0;
   await finalizeListeningSlots(slots, (question, message, level = 'info', agent = 'Media Agent') => {
     audioProgress += level === 'success' ? 1 : 0;
-    const percent = 78 + (Math.min(listeningSlots.length, Math.max(1, audioProgress || 1)) / Math.max(1, listeningSlots.length)) * 11;
+    const percent = 78 + (Math.min(listeningSlots.length, Math.max(1, audioProgress || 1)) / Math.max(1, listeningSlots.length)) * 10;
     report?.({ stage: 'listening', agent, percent, question, completedQuestions: 40, level, message });
   });
 
   report?.({
-    stage: 'qa', agent: 'QA Agent', percent: 90, question: null, completedQuestions: 40,
-    message: 'Running answer, four-choice, section, audio and duplicate QA across all 40 generated questions.'
+    stage: 'qa', agent: 'QA Agent', percent: 89, question: null, completedQuestions: 40,
+    message: 'Running independent semantic QA: correct answer, ambiguity, Korean naturalness, section fit and explanation consistency.'
   });
-  const qaSlots = runQaForSet(slots);
+  const semanticSlots = await runSemanticQaAgent(slots, event => {
+    report?.({ ...event, percent: Math.max(89, Math.min(94, event.percent ?? 92)), completedQuestions: 40 });
+  });
+
+  report?.({
+    stage: 'qa', agent: 'QA Agent', percent: 95, question: null, completedQuestions: 40,
+    message: 'Running deterministic final checks: four choices, answer index, chapter, section/type, audio readiness and duplicate similarity.'
+  });
+  const qaSlots = runQaForSet(semanticSlots);
   qaSlots.forEach((slot, index) => {
     report?.({
-      stage: 'qa', agent: 'QA Agent', percent: 90 + ((index + 1) / 40) * 7,
+      stage: 'qa', agent: 'QA Agent', percent: 95 + ((index + 1) / 40) * 3,
       question: slot.slot, completedQuestions: 40,
       level: slot.question?.qa?.passed ? 'success' : 'warn',
-      message: `Q${slot.slot}: QA ${slot.question?.qa?.score ?? 0}%${slot.question?.qaFlags?.length ? ` · ${slot.question.qaFlags.join(', ')}` : ''}.`
+      message: `Q${slot.slot}: final QA ${slot.question?.qa?.score ?? 0}%${slot.question?.qaFlags?.length ? ` · ${slot.question.qaFlags.join(', ')}` : ''}.`
     });
   });
 
