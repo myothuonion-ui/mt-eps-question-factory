@@ -2,6 +2,8 @@ export type QuestionType = 'listening' | 'reading' | 'blank' | 'vocabulary' | 'g
 export type QuestionOrigin = 'imported' | 'generated';
 export type ReviewState = 'not_reviewed' | 'edited' | 'approved' | 'rejected';
 export type SpeakerRole = 'narrator' | 'male' | 'female';
+export type ExamSection = 'reading' | 'listening';
+export type AgentName = 'Controller Agent' | 'Form Agent' | 'Structure Agent' | 'Media Agent' | 'Alignment Agent' | 'Generator Agent' | 'QA Agent';
 
 export type MediaRef = {
   kind: 'image' | 'youtube' | 'audio' | 'video' | 'link';
@@ -40,12 +42,16 @@ export type QaResult = {
 export type NormalizedQuestion = {
   id: string;
   sourceOrder: number;
+  documentOrder?: number;
   stem: string;
   options: string[];
   correctAnswerIndex: number | null;
   answerEvidence?: string | null;
   explanation?: string | null;
   type: QuestionType;
+  section?: ExamSection | null;
+  sectionLabel?: string | null;
+  sectionConfidence?: number;
   chapter: ChapterGuess;
   patternId?: string | null;
   media: MediaRef[];
@@ -65,6 +71,16 @@ export type NormalizedQuestion = {
   };
 };
 
+export type DetectedSection = {
+  kind: ExamSection;
+  label: string;
+  documentOrder: number;
+  questionStart?: number | null;
+  questionEnd?: number | null;
+  questionCount: number;
+  confidence: number;
+};
+
 export type AnalysisDiagnostics = {
   parserStrategy: string;
   candidateBlockCounts: Record<string, number>;
@@ -74,6 +90,9 @@ export type AnalysisDiagnostics = {
   globalYoutube: number;
   globalImages: number;
   answerEvidenceCount: number;
+  detectedSections?: DetectedSection[];
+  sectionOrder?: ExamSection[];
+  sectionSource?: 'heading' | 'youtube-boundary' | 'fallback-20-20' | 'mixed';
   warnings: string[];
 };
 
@@ -84,6 +103,7 @@ export type ImportAnalysis = {
   importedAt: string;
   mediaPool?: MediaRef[];
   generationChapters?: number[];
+  sectionPlan?: ExamSection[];
   diagnostics?: AnalysisDiagnostics;
   counts: {
     questions: number;
@@ -98,7 +118,7 @@ export type ImportAnalysis = {
 
 export type ExamSlot = {
   slot: number;
-  section: 'listening' | 'reading';
+  section: ExamSection;
   patternId: string;
   expectedType: QuestionType;
   question: NormalizedQuestion | null;
@@ -171,28 +191,41 @@ export type ProviderSettings = {
   cloudflare: { configured: boolean; accountId: string; imageModel: string };
 };
 
-export type GenerationJobStage = 'queued' | 'prepare' | 'generation' | 'listening' | 'qa' | 'save' | 'done' | 'error';
+export type GenerationJobStage = 'queued' | 'form' | 'structure' | 'prepare' | 'generation' | 'listening' | 'qa' | 'save' | 'done' | 'error';
 export type GenerationJobLog = {
   id: string;
   at: string;
   level: 'info' | 'warn' | 'error' | 'success';
   stage: GenerationJobStage;
+  agent?: AgentName;
   question?: number | null;
   message: string;
+};
+export type GenerationJobSummary = {
+  references: number;
+  reading: number;
+  listening: number;
+  youtube: number;
+  answers: number;
+  sectionOrder: ExamSection[];
+  sectionSource?: string | null;
 };
 export type GenerationJob = {
   id: string;
   status: 'queued' | 'running' | 'completed' | 'failed';
   percent: number;
   stage: GenerationJobStage;
+  currentAgent: AgentName;
   currentQuestion: number | null;
   completedQuestions: number;
   totalQuestions: number;
   provider: string;
   fallbackCount: number;
+  summary?: GenerationJobSummary | null;
   createdAt: string;
   updatedAt: string;
   setId?: string | null;
+  importId?: string | null;
   error?: string | null;
   logs: GenerationJobLog[];
 };

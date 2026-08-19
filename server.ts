@@ -13,6 +13,7 @@ import { activeTtsProviderName, generateListeningAudio } from './server/tts.js';
 import { analyzeYoutube, commandAvailable, cutAudioSegment } from './server/mediaProcessor.js';
 import { getProviderSettings, saveProviderSettings } from './server/providerSettings.js';
 import { createGenerationJob, failGenerationJob, finishGenerationJob, getGenerationJob, reportGenerationProgress } from './server/jobManager.js';
+import { runControllerAgent } from './server/agents/controllerAgent.js';
 import {
   addRevision,
   dataRoot,
@@ -29,7 +30,7 @@ import {
 } from './server/store.js';
 import type { ExamSet, ImportAnalysis, NormalizedQuestion, VoiceProfile } from './src/shared/types.js';
 
-const APP_VERSION = '0.3.0';
+const APP_VERSION = '0.5.0';
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 250 * 1024 * 1024, files: 30 } });
 app.use(cors());
@@ -123,6 +124,25 @@ app.post('/api/import/files', upload.array('files', 30), async (req, res) => {
 
 app.get('/api/imports', async (_req, res) => res.json({ ok: true, imports: await listImports() }));
 
+const controllerBuildSchema = z.object({ url: z.string().url(), name: z.string().max(160).optional() });
+app.post('/api/agent/build-form-40-job', (req, res) => {
+  try {
+    const payload = controllerBuildSchema.parse(req.body);
+    const job = createGenerationJob();
+    res.status(202).json({ ok: true, job });
+    void (async () => {
+      try {
+        const result = await runControllerAgent(payload.url, payload.name, event => reportGenerationProgress(job.id, event));
+        finishGenerationJob(job.id, result.setId);
+      } catch (error) {
+        failGenerationJob(job.id, message(error));
+      }
+    })();
+  } catch (error) {
+    res.status(400).json({ ok: false, error: message(error) });
+  }
+});
+
 const analysisSchema = z.object({ analysis: z.any(), name: z.string().max(160).optional() });
 app.post('/api/exam/build-40', async (req, res) => {
   try {
@@ -134,7 +154,6 @@ app.post('/api/exam/build-40', async (req, res) => {
   }
 });
 
-// Synchronous endpoint kept for CI/smoke testing and compatibility.
 app.post('/api/exam/complete-40', async (req, res) => {
   try {
     const payload = analysisSchema.parse(req.body) as { analysis: ImportAnalysis; name?: string };
@@ -146,7 +165,6 @@ app.post('/api/exam/complete-40', async (req, res) => {
   }
 });
 
-// UI uses a background job so progress, current question and provider fallback are visible live.
 app.post('/api/exam/generate-40-job', (req, res) => {
   try {
     const payload = analysisSchema.parse(req.body) as { analysis: ImportAnalysis; name?: string };
@@ -154,11 +172,11 @@ app.post('/api/exam/generate-40-job', (req, res) => {
     res.status(202).json({ ok: true, job });
     void (async () => {
       try {
-        reportGenerationProgress(job.id, { stage: 'prepare', percent: 1, question: null, message: 'Generation job started.' });
+        reportGenerationProgress(job.id, { stage: 'prepare', agent: 'Controller Agent', percent: 18, question: null, message: 'Generation job started from an existing analysis.' });
         const set = await complete40QuestionSet(payload.analysis, payload.name, event => reportGenerationProgress(job.id, event));
-        reportGenerationProgress(job.id, { stage: 'save', percent: 98, question: null, completedQuestions: 40, message: 'Saving completed 40Q set locally.' });
+        reportGenerationProgress(job.id, { stage: 'save', agent: 'Controller Agent', percent: 98, question: null, completedQuestions: 40, message: 'Saving completed 40Q set locally.' });
         const saved = await saveSet(set);
-        reportGenerationProgress(job.id, { stage: 'done', percent: 100, question: null, completedQuestions: 40, level: 'success', message: `40/40 complete. Set ${saved.id} is ready; review is optional.` });
+        reportGenerationProgress(job.id, { stage: 'done', agent: 'Controller Agent', percent: 100, question: null, completedQuestions: 40, level: 'success', message: `40/40 complete. Set ${saved.id} is ready; review is optional.` });
         finishGenerationJob(job.id, saved.id);
       } catch (error) {
         failGenerationJob(job.id, message(error));

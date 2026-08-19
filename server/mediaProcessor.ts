@@ -37,6 +37,55 @@ export async function commandAvailable(command: string, args = ['--version']) {
   }
 }
 
+const TOOLS_DIR = path.join(path.dirname(MEDIA_DIR), 'tools');
+const LOCAL_YTDLP = path.join(TOOLS_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+let ytDlpBootstrap: Promise<string | null> | null = null;
+
+async function localYtDlpWorks() {
+  try {
+    await fs.access(LOCAL_YTDLP);
+    await run(LOCAL_YTDLP, ['--version'], 8000);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function bootstrapYtDlp() {
+  if (await commandAvailable('yt-dlp')) return 'yt-dlp';
+  if (await localYtDlpWorks()) return LOCAL_YTDLP;
+  await fs.mkdir(TOOLS_DIR, { recursive: true });
+  const asset = process.platform === 'win32'
+    ? 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'
+    : 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
+  try {
+    const response = await fetch(asset, { redirect: 'follow' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (bytes.length < 500_000) throw new Error('Downloaded yt-dlp file is unexpectedly small.');
+    const temp = `${LOCAL_YTDLP}.tmp`;
+    await fs.writeFile(temp, bytes);
+    if (process.platform !== 'win32') await fs.chmod(temp, 0o755);
+    await fs.rename(temp, LOCAL_YTDLP);
+    await run(LOCAL_YTDLP, ['--version'], 12_000);
+    return LOCAL_YTDLP;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveYtDlp(autoBootstrap = true) {
+  if (await commandAvailable('yt-dlp')) return 'yt-dlp';
+  if (await localYtDlpWorks()) return LOCAL_YTDLP;
+  if (!autoBootstrap) return null;
+  ytDlpBootstrap ??= bootstrapYtDlp();
+  return ytDlpBootstrap;
+}
+
+export async function ytDlpAvailable() {
+  return !!(await resolveYtDlp(false));
+}
+
 function assertYoutubeUrl(raw: string) {
   const url = new URL(raw);
   const host = url.hostname.toLowerCase();
@@ -62,13 +111,7 @@ function parseClock(value: string) {
 }
 
 function stripVttText(value: string) {
-  return value
-    .replace(/<\d\d:\d\d(?::\d\d)?\.\d+>/g, ' ')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&')
-    .replace(/\s+/g, ' ')
-    .trim();
+  return value.replace(/<\d\d:\d\d(?::\d\d)?\.\d+>/g, ' ').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/\s+/g, ' ').trim();
 }
 
 function parseVtt(vtt: string): MediaSegment[] {
@@ -83,18 +126,15 @@ function parseVtt(vtt: string): MediaSegment[] {
     const textLines: string[] = [];
     let cursor = index + 1;
     while (cursor < lines.length && lines[cursor].trim()) {
-      const clean = stripVttText(lines[cursor]);
-      if (clean) textLines.push(clean);
+      const cleaned = stripVttText(lines[cursor]);
+      if (cleaned) textLines.push(cleaned);
       cursor += 1;
     }
     const text = stripVttText(textLines.join(' '));
     if (end > start && text) {
       const previous = segments[segments.length - 1];
-      if (previous && previous.text === text && Math.abs(previous.end - start) < 0.6) {
-        previous.end = end;
-      } else {
-        segments.push({ id: `SEG-${randomUUID()}`, start, end, text, speaker: null });
-      }
+      if (previous && previous.text === text && Math.abs(previous.end - start) < 0.6) previous.end = end;
+      else segments.push({ id: `SEG-${randomUUID()}`, start, end, text, speaker: null });
     }
     index = Math.max(index, cursor - 1);
   }
@@ -104,39 +144,28 @@ function parseVtt(vtt: string): MediaSegment[] {
 export async function extractYoutubeCaptions(rawUrl: string): Promise<MediaSegment[]> {
   await fs.mkdir(MEDIA_DIR, { recursive: true });
   const url = assertYoutubeUrl(rawUrl);
-  if (!await commandAvailable('yt-dlp')) return [];
+  const ytdlp = await resolveYtDlp(true);
+  if (!ytdlp) return [];
   const prefix = `captions-${Date.now()}-${randomUUID().slice(0, 6)}`;
   const template = path.join(MEDIA_DIR, `${prefix}.%(ext)s`);
   try {
-    await run('yt-dlp', [
-      '--no-playlist',
-      '--skip-download',
-      '--write-subs',
-      '--write-auto-subs',
-      '--sub-langs', 'ko.*,ko,en.*,en',
-      '--sub-format', 'vtt',
-      '-o', template,
-      url
-    ], 5 * 60_000);
+    await run(ytdlp, ['--no-playlist', '--skip-download', '--write-subs', '--write-auto-subs', '--sub-langs', 'ko.*,ko,en.*,en', '--sub-format', 'vtt', '-o', template, url], 5 * 60_000);
   } catch {
     return [];
   }
   const subtitlePath = await findNewest(prefix, '.vtt');
   if (!subtitlePath) return [];
-  try {
-    return parseVtt(await fs.readFile(subtitlePath, 'utf8'));
-  } catch {
-    return [];
-  }
+  try { return parseVtt(await fs.readFile(subtitlePath, 'utf8')); } catch { return []; }
 }
 
 export async function downloadYoutubeAudio(rawUrl: string) {
   await fs.mkdir(MEDIA_DIR, { recursive: true });
   const url = assertYoutubeUrl(rawUrl);
-  if (!await commandAvailable('yt-dlp')) throw new Error('yt-dlp is not installed or not available in PATH.');
+  const ytdlp = await resolveYtDlp(true);
+  if (!ytdlp) throw new Error('yt-dlp could not be bootstrapped locally.');
   const prefix = `youtube-${Date.now()}-${randomUUID().slice(0, 6)}`;
   const template = path.join(MEDIA_DIR, `${prefix}.%(ext)s`);
-  await run('yt-dlp', ['--no-playlist', '-x', '--audio-format', 'wav', '--audio-quality', '0', '-o', template, url], 30 * 60_000);
+  await run(ytdlp, ['--no-playlist', '-x', '--audio-format', 'wav', '--audio-quality', '0', '-o', template, url], 30 * 60_000);
   const audioPath = await findNewest(prefix, '.wav');
   if (!audioPath) throw new Error('yt-dlp completed but no WAV file was created.');
   return audioPath;
@@ -147,9 +176,7 @@ async function durationSeconds(filePath: string) {
     const { stdout } = await run('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', filePath], 20_000);
     const value = Number(stdout.trim());
     return Number.isFinite(value) ? value : null;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
 async function silenceSegments(filePath: string): Promise<MediaSegment[]> {
@@ -191,16 +218,9 @@ async function whisperSegments(filePath: string): Promise<MediaSegment[] | null>
   try {
     const json = JSON.parse(await fs.readFile(outputPath, 'utf8')) as any;
     if (!Array.isArray(json?.segments)) return null;
-    return json.segments.map((segment: any) => ({
-      id: `SEG-${randomUUID()}`,
-      start: Number(segment.start ?? 0),
-      end: Number(segment.end ?? 0),
-      text: String(segment.text ?? '').trim(),
-      speaker: null
-    })).filter((segment: MediaSegment) => segment.end > segment.start);
-  } catch {
-    return null;
-  }
+    return json.segments.map((segment: any) => ({ id: `SEG-${randomUUID()}`, start: Number(segment.start ?? 0), end: Number(segment.end ?? 0), text: String(segment.text ?? '').trim(), speaker: null }))
+      .filter((segment: MediaSegment) => segment.end > segment.start);
+  } catch { return null; }
 }
 
 export async function analyzeYoutube(rawUrl: string): Promise<MediaAnalysis> {
