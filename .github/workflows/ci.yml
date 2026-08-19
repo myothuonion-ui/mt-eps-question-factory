@@ -15,6 +15,19 @@ jobs:
           node-version: 22
       - run: npm install --no-audit --no-fund
       - run: npm run typecheck
+      - name: Verify AI-free YouTube alignment path
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -R "geminiVideo\|alignQuestionsWithYoutube" server --include='*.ts'; then
+            echo "Video alignment must not call Gemini/AI."
+            exit 1
+          fi
+          grep -q "extractYoutubeCaptions" server/listeningPipeline.ts
+          grep -q "localAlignQuestions" server/listeningPipeline.ts
+          grep -q "cachedYoutube" server/listeningPipeline.ts
+          grep -q "cutAudioSegment" server/listeningPipeline.ts
+          echo "AI-free video path verified: yt-dlp captions -> local matcher -> Whisper/audio fallback -> FFmpeg."
       - run: npm run build
       - name: Production runtime smoke test
         shell: bash
