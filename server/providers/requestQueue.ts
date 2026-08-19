@@ -51,21 +51,22 @@ function parseDurationText(text: string) {
 
 export function retryAfterMs(error: unknown) {
   const anyError = error as any;
-  const explicit = Number(anyError?.retryAfterMs);
+  const explicit = Number(anyError?.retryAfterMs ?? anyError?.details?.retryAfterMs);
   if (Number.isFinite(explicit) && explicit > 0) return explicit;
   const text = error instanceof Error ? error.message : String(error ?? '');
   return parseDurationText(text);
 }
 
 export function isRateLimitError(error: unknown) {
-  const status = Number((error as any)?.status ?? 0);
+  const anyError = error as any;
+  const status = Number(anyError?.status ?? anyError?.details?.status ?? 0);
+  const classification = String(anyError?.details?.classification ?? '');
   const text = error instanceof Error ? error.message : String(error ?? '');
-  return status === 429 || /\b429\b|too many requests|resource_exhausted|quota\/rate limit|rate limit/i.test(text);
+  return status === 429 || classification.endsWith('_429') || /\b429\b|too many requests|resource_exhausted|quota\/rate limit|rate limit/i.test(text);
 }
 
-function looksLikeDailyQuota(error: unknown) {
-  const text = error instanceof Error ? error.message : String(error ?? '');
-  return /PerDay|per day|daily quota|GenerateRequestsPerDay/i.test(text);
+function quotaClass(error: unknown) {
+  return String((error as any)?.details?.classification ?? '');
 }
 
 export function registerRateLimit(provider: ProviderName, error: unknown) {
@@ -76,8 +77,13 @@ export function registerRateLimit(provider: ProviderName, error: unknown) {
 
   const serverRetry = retryAfterMs(error);
   const exponential = Math.min(90_000, 8_000 * (2 ** Math.min(4, state.consecutive429 - 1)));
-  const dailyFloor = looksLikeDailyQuota(error) ? 5 * 60_000 : 0;
-  const cooldown = Math.max(serverRetry, exponential, dailyFloor, 5_000);
+  const classification = quotaClass(error);
+  const classFloor = classification === 'DAILY_QUOTA_429'
+    ? 6 * 60 * 60_000
+    : classification === 'MODEL_QUOTA_429'
+      ? 30 * 60_000
+      : 0;
+  const cooldown = Math.max(serverRetry, exponential, classFloor, 5_000);
   state.cooldownUntil = Math.max(state.cooldownUntil, now + cooldown);
   return cooldown;
 }
