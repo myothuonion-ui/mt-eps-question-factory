@@ -1,6 +1,12 @@
 import type { ExamSlot, NormalizedQuestion } from '../../src/shared/types.js';
 import { getProviderSettings } from '../providerSettings.js';
 import type { ProgressEvent } from '../jobManager.js';
+import {
+  appendProviderDiagnostic,
+  classifyProviderHttpError,
+  classifyUnknownProviderError,
+  type ProviderErrorDetails
+} from '../providers/providerDiagnostics.js';
 
 export type SemanticVerdict = {
   slot: number;
@@ -15,6 +21,7 @@ export type SemanticVerdict = {
 };
 
 type Verifier = 'gemini' | 'glm';
+type QaError = Error & { details?: ProviderErrorDetails; status?: number; retryAfterMs?: number };
 
 function parseJson(text: string) {
   const clean = text.replace(/```(?:json)?/gi, '').replace(/```/g, '').trim();
@@ -85,6 +92,15 @@ function validate(raw: unknown, expected: ExamSlot[]): SemanticVerdict[] {
   return expected.flatMap(slot => bySlot.has(slot.slot) ? [bySlot.get(slot.slot)!] : []);
 }
 
+function httpError(provider: Verifier, model: string, response: Response, body: string): QaError {
+  const details = classifyProviderHttpError({ provider, model, status: response.status, body, retryAfterHeader: response.headers.get('retry-after') });
+  const error = new Error(`${provider.toUpperCase()} QA ${details.classification} HTTP ${response.status}: ${details.message}`) as QaError;
+  error.status = response.status;
+  error.retryAfterMs = details.retryAfterMs;
+  error.details = details;
+  return error;
+}
+
 async function callGemini(slots: ExamSlot[]) {
   const settings = getProviderSettings();
   const key = process.env.GEMINI_API_KEY ?? '';
@@ -93,7 +109,10 @@ async function callGemini(slots: ExamSlot[]) {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ contents: [{ parts: [{ text: prompt(slots) }] }], generationConfig: { temperature: 0.05, responseMimeType: 'application/json' } })
   });
-  if (!response.ok) throw new Error(`Gemini QA failed HTTP ${response.status}: ${(await response.text()).slice(0, 500)}`);
+  if (!response.ok) {
+    const body = await response.text();
+    throw httpError('gemini', settings.gemini.model, response, body);
+  }
   const json = await response.json() as any;
   const text = json?.candidates?.[0]?.content?.parts?.map((part: any) => part?.text ?? '').join('');
   if (!text) throw new Error('Gemini QA returned no content.');
@@ -109,7 +128,10 @@ async function callGlm(slots: ExamSlot[]) {
     method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
     body: JSON.stringify({ model: settings.glm.model, temperature: 0.05, messages: [{ role: 'user', content: prompt(slots) }] })
   });
-  if (!response.ok) throw new Error(`GLM QA failed HTTP ${response.status}: ${(await response.text()).slice(0, 500)}`);
+  if (!response.ok) {
+    const body = await response.text();
+    throw httpError('glm', settings.glm.model, response, body);
+  }
   const json = await response.json() as any;
   const text = json?.choices?.[0]?.message?.content;
   if (!text) throw new Error('GLM QA returned no content.');
@@ -123,25 +145,40 @@ function verifierOrder(slots: ExamSlot[]): Verifier[] {
   if (!gemini && !glm) return [];
   const generatedByGemini = slots.filter(slot => slot.question?.generatedBy === 'gemini').length;
   const generatedByGlm = slots.filter(slot => slot.question?.generatedBy === 'glm').length;
-  // Prefer a different model from the model that created most items in the batch.
   if (generatedByGlm >= generatedByGemini && gemini) return glm ? ['gemini', 'glm'] : ['gemini'];
   if (generatedByGemini > generatedByGlm && glm) return gemini ? ['glm', 'gemini'] : ['glm'];
   return gemini ? (glm ? ['gemini', 'glm'] : ['gemini']) : ['glm'];
+}
+
+function exactMessage(provider: Verifier, error: unknown) {
+  const attached = (error as QaError)?.details;
+  const settings = getProviderSettings();
+  const details = attached ?? classifyUnknownProviderError(provider, provider === 'gemini' ? settings.gemini.model : settings.glm.model, error);
+  if (details.classification === 'AUTH_401' || details.classification === 'AUTH_403') return `${provider.toUpperCase()} QA authentication failed · ${details.classification}.`;
+  if (details.classification === 'DAILY_QUOTA_429') return `${provider.toUpperCase()} QA daily quota reached · ${details.quotaId ?? 'per-day quota'}.`;
+  if (details.classification === 'TEMP_RATE_LIMIT_429') return `${provider.toUpperCase()} QA temporary rate limit · retry ${details.retryAfterMs ? `${Math.ceil(details.retryAfterMs / 1000)}s` : 'later'}.`;
+  return `${provider.toUpperCase()} QA ${details.classification} · ${details.message}`;
 }
 
 async function verifyBatch(slots: ExamSlot[], report?: (event: ProgressEvent) => void) {
   const order = verifierOrder(slots);
   if (!order.length) return { verdicts: [] as SemanticVerdict[], provider: null as string | null, skipped: 'No independent AI verifier configured.' };
   let lastError = '';
+  let attempt = 0;
   for (const verifier of order) {
+    attempt += 1;
     try {
       report?.({ stage: 'qa', agent: 'QA Agent', question: slots[0]?.slot ?? null, provider: verifier, message: `Independent semantic QA Q${slots[0]?.slot}–Q${slots[slots.length - 1]?.slot} with ${verifier.toUpperCase()}.` });
       const verdicts = verifier === 'gemini' ? await callGemini(slots) : await callGlm(slots);
       if (verdicts.length !== slots.length) throw new Error(`${verifier} returned ${verdicts.length}/${slots.length} QA verdicts.`);
       return { verdicts, provider: verifier, skipped: null };
     } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error);
-      report?.({ stage: 'qa', agent: 'QA Agent', question: slots[0]?.slot ?? null, provider: verifier, level: 'warn', fallback: true, message: `${verifier.toUpperCase()} semantic QA unavailable · ${lastError.slice(0, 260)}. Trying fallback when available.` });
+      const settings = getProviderSettings();
+      const attached = (error as QaError)?.details;
+      const details = attached ?? classifyUnknownProviderError(verifier, verifier === 'gemini' ? settings.gemini.model : settings.glm.model, error);
+      await appendProviderDiagnostic(details, slots[0]?.slot ?? null, slots[slots.length - 1]?.slot ?? null, attempt);
+      lastError = exactMessage(verifier, error);
+      report?.({ stage: 'qa', agent: 'QA Agent', question: slots[0]?.slot ?? null, provider: verifier, level: 'warn', fallback: true, message: `${lastError} Trying fallback when available. Exact sanitized details saved to data/diagnostics/provider-errors.jsonl.` });
     }
   }
   return { verdicts: [] as SemanticVerdict[], provider: null as string | null, skipped: lastError || 'Semantic QA unavailable.' };
