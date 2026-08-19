@@ -31,4 +31,13 @@ jobs:
           curl -fsS -X POST http://127.0.0.1:8787/api/exam/complete-40 \
             -H 'content-type: application/json' \
             --data '{"analysis":{"id":"smoke","sourceUrl":"local://smoke","sourceTitle":"Smoke","importedAt":"2026-08-18T00:00:00Z","counts":{"questions":0,"listening":0,"reading":0,"images":0,"youtube":0,"answersDetected":0},"questions":[]}}' >/tmp/set.json
-          node -e "const x=require('/tmp/set.json'); if(!x.ok || !x.set.complete || x.set.slots.length!==40) process.exit(1); console.log('40Q smoke:', x.set.slots.length, x.set.complete)"
+          node - <<'NODE'
+          const x=require('/tmp/set.json');
+          if(!x.ok || !x.set.complete || x.set.slots.length!==40) process.exit(1);
+          const reading=x.set.slots.slice(0,20);
+          const listening=x.set.slots.slice(20,40);
+          if(reading.some(s=>s.section!=='reading'||s.question?.type==='listening')) throw new Error('Q1-Q20 must be Reading');
+          if(listening.some(s=>s.section!=='listening'||s.question?.type!=='listening')) throw new Error('Q21-Q40 must be Listening');
+          if(reading[0].patternId!=='R01'||reading[19].patternId!=='R20'||listening[0].patternId!=='L01'||listening[19].patternId!=='L20') throw new Error('Pattern order mismatch');
+          console.log('40Q smoke:', x.set.slots.length, x.set.complete, 'Reading 20 -> Listening 20');
+          NODE
