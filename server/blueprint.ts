@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { ExamSet, ExamSlot, ImportAnalysis, NormalizedQuestion, QuestionType } from '../src/shared/types.js';
 import { generateQuestionBatch, type GenerationSpec } from './providers/aiProvider.js';
-import { finalizeListeningSlots, prepareListeningReference } from './listeningPipeline.js';
+import { finalizeListeningSlots, prepareListeningReferences } from './listeningPipeline.js';
 import { runQaForSet } from './qa.js';
 import { getProviderSettings } from './providerSettings.js';
 import type { ProgressEvent } from './jobManager.js';
@@ -56,20 +56,42 @@ type Reporter = (event: ProgressEvent) => void;
 export async function complete40QuestionSet(analysis: ImportAnalysis, name?: string, report?: Reporter): Promise<ExamSet> {
   const slots = createBlueprint(analysis, false);
   const specs: GenerationSpec[] = [];
-  const preparedBySlot = new Map<number, Awaited<ReturnType<typeof prepareListeningReference>>>();
   report?.({ stage: 'prepare', percent: 2, question: null, completedQuestions: 0, message: `Preparing 40 slots from ${analysis.questions.length} analyzed source questions.` });
+
+  const listeningReferences = analysis.questions
+    .filter(question => question.sourceOrder <= 20)
+    .filter(question => question.media?.some(item => item.kind === 'youtube'));
+  const uniqueYoutubeCount = new Set(listeningReferences.flatMap(question => question.media.filter(item => item.kind === 'youtube').map(item => item.url))).size;
+  const preparedByReference = listeningReferences.length
+    ? await prepareListeningReferences(listeningReferences, (question, message, level = 'info') => {
+        report?.({
+          stage: 'prepare',
+          percent: 3 + ((question ?? 1) / 20) * 7,
+          question,
+          completedQuestions: 0,
+          level,
+          message
+        });
+      })
+    : new Map();
+
+  if (listeningReferences.length) {
+    report?.({
+      stage: 'prepare',
+      percent: 10,
+      question: null,
+      completedQuestions: 0,
+      level: 'success',
+      message: `Hybrid listening preparation finished for ${uniqueYoutubeCount} unique YouTube source(s); cached results will be reused across Q1–Q20.`
+    });
+  }
 
   for (const slot of slots) {
     const chapter = chapterForSlot(slot.slot, analysis);
     const reference = analysis.questions.find(item => item.sourceOrder === slot.slot);
     const hasOwnedMedia = slot.section === 'listening' && !!reference?.media?.some(item => item.kind === 'youtube' || item.kind === 'audio' || item.kind === 'video');
-    report?.({ stage: 'prepare', percent: 2 + (slot.slot / 40) * 8, question: slot.slot, completedQuestions: 0, message: `Q${slot.slot}: pattern ${slot.patternId}, Chapter ${chapter}, ${slot.expectedType}.` });
-    let prepared: Awaited<ReturnType<typeof prepareListeningReference>> = null;
-    if (hasOwnedMedia && reference) {
-      report?.({ stage: 'prepare', percent: 2 + (slot.slot / 40) * 8, question: slot.slot, message: `Q${slot.slot}: preparing owned listening source and transcript context.` });
-      prepared = await prepareListeningReference(reference);
-      preparedBySlot.set(slot.slot, prepared);
-    }
+    report?.({ stage: 'prepare', percent: 10, question: slot.slot, completedQuestions: 0, message: `Q${slot.slot}: pattern ${slot.patternId}, Chapter ${chapter}, ${slot.expectedType}.` });
+    const prepared = reference ? preparedByReference.get(reference.id) ?? null : null;
     specs.push({
       slot: slot.slot,
       section: slot.section,
@@ -107,7 +129,7 @@ export async function complete40QuestionSet(analysis: ImportAnalysis, name?: str
       const spec = batch[i];
       const slot = slots[spec.slot - 1];
       const reference = analysis.questions.find(item => item.sourceOrder === spec.slot);
-      const prepared = preparedBySlot.get(spec.slot);
+      const prepared = reference ? preparedByReference.get(reference.id) ?? null : null;
       if (slot.section === 'listening' && reference?.media?.length) {
         question.media = reference.media.filter(item => item.kind === 'youtube' || item.kind === 'audio' || item.kind === 'video');
         question.provenance.sourceQuestionId = reference.id;
@@ -123,7 +145,7 @@ export async function complete40QuestionSet(analysis: ImportAnalysis, name?: str
     }
   }
 
-  report?.({ stage: 'listening', percent: 72, question: 1, completedQuestions: 40, message: 'Finalizing listening audio for Q1–Q20.' });
+  report?.({ stage: 'listening', percent: 72, question: 1, completedQuestions: 40, message: 'Finalizing listening audio for Q1–Q20. Prepared source clips are reused; TTS is fallback only.' });
   await finalizeListeningSlots(slots, (question, message, level = 'info') => {
     const percent = 72 + (Math.min(20, Math.max(1, question)) / 20) * 15;
     report?.({ stage: 'listening', percent, question, completedQuestions: 40, level, message });
