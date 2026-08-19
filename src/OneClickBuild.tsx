@@ -9,7 +9,7 @@ async function jsonApi<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 function friendly(text: string) {
-  if (/429|quota|RESOURCE_EXHAUSTED/i.test(text)) return 'Gemini quota is limited right now. The Controller will keep using captions/Whisper and GLM fallback when configured.';
+  if (/429|quota|RESOURCE_EXHAUSTED/i.test(text)) return 'AI generation/QA provider quota is limited right now. YouTube analysis does not use Gemini anymore; the Controller will wait/fallback between Gemini and GLM.';
   return text.length > 420 ? `${text.slice(0, 417)}...` : text;
 }
 
@@ -64,7 +64,7 @@ export function OneClickBuild() {
     setError('');
     setJob(null);
     setStarting(true);
-    setPhase('Controller Agent is starting the Form → Structure → Media/Alignment → Generator → QA pipeline…');
+    setPhase('Controller Agent is starting the Form → Structure → local Media/Alignment → Generator → QA pipeline…');
     try {
       const started = await jsonApi<{ ok: true; job: GenerationJob }>('/api/agent/build-form-40-job', {
         method: 'POST',
@@ -98,7 +98,7 @@ export function OneClickBuild() {
   return <aside className={`one-click-build ${running ? 'running' : ''}`}>
     <div className="one-click-head">
       <div>
-        <span className="one-click-badge">CONTROLLER AGENTS v0.5</span>
+        <span className="one-click-badge">CONTROLLER AGENTS v0.5.2</span>
         <strong>Answered Google Form → Reading 20 → Listening 20 → Fresh 40Q</strong>
       </div>
       <button className="one-click-minimize" onClick={() => setMinimized(true)} aria-label="Minimize">—</button>
@@ -142,6 +142,6 @@ export function OneClickBuild() {
     </div>)}</div>}
 
     {error && <div className="one-click-error">{friendly(error)}</div>}
-    <small>Normal use is one link + one button. The Form order is the source of truth: section headers and YouTube placement are detected first; YouTube is analyzed once and reused across Listening questions. Review happens only after 40/40 if you want it.</small>
+    <small>Normal use is one link + one button. YouTube analysis is local-only: yt-dlp captions first, Whisper fallback, local timestamp matching, then FFmpeg clip. Gemini/GLM are reserved for question generation and semantic QA. Review happens only after 40/40 if you want it.</small>
   </aside>;
 }
