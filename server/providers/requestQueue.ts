@@ -26,13 +26,13 @@ function numberEnv(name: string, fallback: number, min: number, max: number) {
 }
 
 function providerMinInterval(provider: ProviderName) {
-  const common = numberEnv('AI_MIN_REQUEST_INTERVAL_MS', 1800, 0, 60_000);
-  if (provider === 'gemini') return numberEnv('GEMINI_MIN_REQUEST_INTERVAL_MS', Math.max(common, 3000), 0, 60_000);
-  return numberEnv('GLM_MIN_REQUEST_INTERVAL_MS', Math.max(common, 2500), 0, 60_000);
+  const common = numberEnv('AI_MIN_REQUEST_INTERVAL_MS', 3000, 0, 60_000);
+  if (provider === 'gemini') return numberEnv('GEMINI_MIN_REQUEST_INTERVAL_MS', Math.max(common, 6500), 0, 60_000);
+  return numberEnv('GLM_MIN_REQUEST_INTERVAL_MS', Math.max(common, 4500), 0, 60_000);
 }
 
 function globalMinInterval() {
-  return numberEnv('AI_GLOBAL_MIN_REQUEST_INTERVAL_MS', 900, 0, 60_000);
+  return numberEnv('AI_GLOBAL_MIN_REQUEST_INTERVAL_MS', 1500, 0, 60_000);
 }
 
 function parseDurationText(text: string) {
