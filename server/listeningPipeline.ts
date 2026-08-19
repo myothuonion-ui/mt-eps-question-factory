@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { AudioAsset, ExamSlot, MediaAnalysis, MediaSegment, NormalizedQuestion } from '../src/shared/types.js';
+import type { AgentName, AudioAsset, ExamSlot, MediaAnalysis, MediaSegment, NormalizedQuestion } from '../src/shared/types.js';
 import { analyzeYoutube, cutAudioSegment, downloadYoutubeAudio, extractYoutubeCaptions } from './mediaProcessor.js';
 import { alignQuestionsWithYoutube, type VideoAlignment } from './geminiVideo.js';
 import { listVoiceProfiles } from './store.js';
@@ -76,9 +76,9 @@ async function cachedCaptions(url: string) {
 async function cachedAudioPath(url: string) {
   const existing = audioPathCache.get(url);
   if (existing) return existing;
-  const path = await downloadYoutubeAudio(url);
-  audioPathCache.set(url, path);
-  return path;
+  const downloaded = await downloadYoutubeAudio(url);
+  audioPathCache.set(url, downloaded);
+  return downloaded;
 }
 
 function shortError(error: unknown) {
@@ -94,7 +94,7 @@ export type PreparedListeningReference = {
   flags: string[];
 };
 
-type HybridReporter = (question: number | null, message: string, level?: 'info' | 'warn' | 'success') => void;
+type HybridReporter = (question: number | null, message: string, level?: 'info' | 'warn' | 'success', agent?: AgentName) => void;
 
 function youtubeFor(question: NormalizedQuestion) {
   return question.media.find(media => media.kind === 'youtube')?.url ?? null;
@@ -116,24 +116,27 @@ export async function prepareListeningReferences(references: NormalizedQuestion[
   let videoIndex = 0;
   for (const [url, questions] of groups) {
     videoIndex += 1;
-    report?.(questions[0]?.sourceOrder ?? null, `YouTube ${videoIndex}/${groups.size}: checking captions for ${questions.length} listening question(s).`, 'info');
+    report?.(questions[0]?.sourceOrder ?? null, `YouTube ${videoIndex}/${groups.size}: checking captions once for ${questions.length} Listening question(s).`, 'info', 'Media Agent');
     let captions: MediaSegment[] = [];
     try {
       captions = await cachedCaptions(url);
-      report?.(questions[0]?.sourceOrder ?? null, captions.length
-        ? `YouTube ${videoIndex}/${groups.size}: ${captions.length} caption segments found.`
-        : `YouTube ${videoIndex}/${groups.size}: no usable captions; semantic/fallback analysis will continue.`, captions.length ? 'success' : 'warn');
+      report?.(
+        questions[0]?.sourceOrder ?? null,
+        captions.length ? `YouTube ${videoIndex}/${groups.size}: ${captions.length} timestamped caption segment(s) found.` : `YouTube ${videoIndex}/${groups.size}: no usable captions; semantic/fallback analysis will continue.`,
+        captions.length ? 'success' : 'warn',
+        'Media Agent'
+      );
     } catch (error) {
-      report?.(questions[0]?.sourceOrder ?? null, `Caption check skipped · ${shortError(error)}`, 'warn');
+      report?.(questions[0]?.sourceOrder ?? null, `Caption check skipped · ${shortError(error)}`, 'warn', 'Media Agent');
     }
 
     let alignments: VideoAlignment[] = [];
     try {
-      report?.(questions[0]?.sourceOrder ?? null, `YouTube ${videoIndex}/${groups.size}: Gemini semantic timestamp alignment (one request for this video).`, 'info');
+      report?.(questions[0]?.sourceOrder ?? null, `YouTube ${videoIndex}/${groups.size}: matching all related questions to video timestamps in one Gemini request.`, 'info', 'Alignment Agent');
       alignments = await alignQuestionsWithYoutube(url, questions);
-      if (alignments.length) report?.(questions[0]?.sourceOrder ?? null, `YouTube ${videoIndex}/${groups.size}: Gemini returned ${alignments.length} question timestamp match(es).`, 'success');
+      if (alignments.length) report?.(questions[0]?.sourceOrder ?? null, `YouTube ${videoIndex}/${groups.size}: ${alignments.length} semantic timestamp match(es) returned.`, 'success', 'Alignment Agent');
     } catch (error) {
-      report?.(questions[0]?.sourceOrder ?? null, shortError(error), 'warn');
+      report?.(questions[0]?.sourceOrder ?? null, shortError(error), 'warn', 'Alignment Agent');
     }
 
     let fallbackMedia: MediaAnalysis | null = null;
@@ -159,12 +162,14 @@ export async function prepareListeningReferences(references: NormalizedQuestion[
         transcript = chosen.text?.trim() ?? '';
         flags.push('HYBRID_GEMINI_VIDEO_MATCH');
         if (aligned.confidence < 0.75) flags.push('YOUTUBE_ALIGNMENT_MEDIUM_CONFIDENCE');
+        report?.(reference.sourceOrder, `Q${reference.sourceOrder}: video segment matched at ${Math.round(chosen.start)}s–${Math.round(chosen.end)}s (${Math.round(aligned.confidence * 100)}%).`, aligned.confidence >= 0.75 ? 'success' : 'warn', 'Alignment Agent');
       } else if (captionMatch.segment && !captionMatch.guessed) {
         chosen = captionMatch.segment;
         transcript = chosen.text?.trim() ?? '';
         flags.push('HYBRID_CAPTION_MATCH');
+        report?.(reference.sourceOrder, `Q${reference.sourceOrder}: matched from timestamped captions.`, 'success', 'Alignment Agent');
       } else {
-        report?.(reference.sourceOrder, `Q${reference.sourceOrder}: captions/Gemini were not confident; trying downloaded audio + Whisper fallback.`, 'warn');
+        report?.(reference.sourceOrder, `Q${reference.sourceOrder}: caption/video confidence low; trying downloaded audio + Whisper fallback.`, 'warn', 'Alignment Agent');
         try {
           fallbackMedia ??= await cachedYoutube(url);
           const fallback = bestSegment(reference, fallbackMedia.segments);
@@ -172,8 +177,10 @@ export async function prepareListeningReferences(references: NormalizedQuestion[
           transcript = fallback.segment?.text?.trim() ?? '';
           flags.push(fallbackMedia.transcriptAvailable ? 'HYBRID_WHISPER_FALLBACK' : 'HYBRID_AUDIO_FALLBACK');
           if (fallback.guessed) flags.push('YOUTUBE_SEGMENT_GUESSED');
+          report?.(reference.sourceOrder, `Q${reference.sourceOrder}: local audio fallback ${fallbackMedia.transcriptAvailable ? 'with Whisper transcript' : 'without transcript'} prepared.`, fallback.guessed ? 'warn' : 'success', 'Media Agent');
         } catch (error) {
           flags.push(`YOUTUBE_FALLBACK_PENDING:${shortError(error)}`);
+          report?.(reference.sourceOrder, `Q${reference.sourceOrder}: local media fallback unavailable · ${shortError(error)}`, 'warn', 'Media Agent');
         }
       }
 
@@ -189,10 +196,10 @@ export async function prepareListeningReferences(references: NormalizedQuestion[
             durationSeconds: chosen.end - chosen.start,
             source: 'youtube'
           };
-          report?.(reference.sourceOrder, `Q${reference.sourceOrder}: source clip ready ${Math.round(chosen.start)}s–${Math.round(chosen.end)}s.`, 'success');
+          report?.(reference.sourceOrder, `Q${reference.sourceOrder}: exact source audio clip ready (${Math.round(chosen.end - chosen.start)}s).`, 'success', 'Media Agent');
         } catch (error) {
           flags.push(`SOURCE_AUDIO_NOT_READY:${shortError(error)}`);
-          report?.(reference.sourceOrder, `Q${reference.sourceOrder}: source clip unavailable; fresh TTS can be used instead · ${shortError(error)}`, 'warn');
+          report?.(reference.sourceOrder, `Q${reference.sourceOrder}: source clip unavailable; grounded transcript/TTS fallback remains available · ${shortError(error)}`, 'warn', 'Media Agent');
         }
       } else {
         flags.push('YOUTUBE_SEGMENT_NOT_FOUND');
@@ -212,7 +219,7 @@ export async function prepareListeningReference(reference: NormalizedQuestion): 
 
 export async function finalizeListeningSlots(
   slots: ExamSlot[],
-  report?: (question: number, message: string, level?: 'info' | 'warn' | 'success') => void
+  report?: (question: number, message: string, level?: 'info' | 'warn' | 'success', agent?: AgentName) => void
 ) {
   const profiles = await listVoiceProfiles();
   const profile = profiles[0];
@@ -221,13 +228,13 @@ export async function finalizeListeningSlots(
     const question = slot.question;
     if (!question || slot.section !== 'listening') continue;
     if (question.audioAsset) {
-      report?.(slot.slot, `Q${slot.slot}: source listening clip already prepared.`, 'success');
+      report?.(slot.slot, `Q${slot.slot}: source listening clip already prepared.`, 'success', 'Media Agent');
       continue;
     }
 
     const youtube = youtubeFor(question);
     if (youtube) {
-      report?.(slot.slot, `Q${slot.slot}: source clip missing; retrying local YouTube audio match.`, 'info');
+      report?.(slot.slot, `Q${slot.slot}: source clip missing; retrying local YouTube audio match.`, 'info', 'Media Agent');
       try {
         const media = await cachedYoutube(youtube);
         const match = bestSegment(question, media.segments);
@@ -241,28 +248,28 @@ export async function finalizeListeningSlots(
           source: 'youtube'
         };
         if (match.guessed) question.qaFlags = [...new Set([...question.qaFlags, 'YOUTUBE_SEGMENT_GUESSED'])];
-        report?.(slot.slot, `Q${slot.slot}: YouTube listening clip ready (${Math.round(match.segment.end - match.segment.start)}s).`, match.guessed ? 'warn' : 'success');
+        report?.(slot.slot, `Q${slot.slot}: YouTube listening clip ready (${Math.round(match.segment.end - match.segment.start)}s).`, match.guessed ? 'warn' : 'success', 'Media Agent');
         continue;
       } catch (error) {
         const text = shortError(error);
         question.qaFlags = [...new Set([...question.qaFlags, `YOUTUBE_AUDIO_PENDING:${text}`])];
-        report?.(slot.slot, `Q${slot.slot}: source audio retry failed; using TTS fallback when a script exists · ${text}`, 'warn');
+        report?.(slot.slot, `Q${slot.slot}: source audio retry failed; using TTS fallback when a grounded/generated script exists · ${text}`, 'warn', 'Media Agent');
       }
     }
 
     if (question.listeningScript?.length && profile) {
-      report?.(slot.slot, `Q${slot.slot}: generating TTS listening audio.`, 'info');
+      report?.(slot.slot, `Q${slot.slot}: generating TTS fallback audio.`, 'info', 'Media Agent');
       try {
         question.audioAsset = await generateListeningAudio(question, profile);
-        report?.(slot.slot, `Q${slot.slot}: TTS audio ready.`, 'success');
+        report?.(slot.slot, `Q${slot.slot}: TTS audio ready.`, 'success', 'Media Agent');
       } catch (error) {
         const text = shortError(error);
         question.qaFlags = [...new Set([...question.qaFlags, `TTS_AUDIO_PENDING:${text}`])];
-        report?.(slot.slot, `Q${slot.slot}: TTS audio pending · ${text}`, 'warn');
+        report?.(slot.slot, `Q${slot.slot}: TTS audio pending · ${text}`, 'warn', 'Media Agent');
       }
     } else {
       question.qaFlags = [...new Set([...question.qaFlags, 'LISTENING_AUDIO_SOURCE_MISSING'])];
-      report?.(slot.slot, `Q${slot.slot}: no usable source clip or generated listening script found.`, 'warn');
+      report?.(slot.slot, `Q${slot.slot}: no usable source clip or listening script found.`, 'warn', 'Media Agent');
     }
   }
   return slots;
