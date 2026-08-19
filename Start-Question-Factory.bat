@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions
 cd /d "%~dp0"
-title MT EPS Question Factory Launcher v0.3.1
+title MT EPS Question Factory Launcher v0.5.0
 
 where node >nul 2>nul
 if errorlevel 1 (
@@ -28,7 +28,7 @@ if not exist node_modules (
 if not exist .env if exist .env.example copy /y .env.example .env >nul
 
 rem API keys are configured inside the app UI. Do not ask for keys in this terminal.
-echo [START] Starting current folder version...
+echo [START] Starting Controller Agent factory from this folder...
 start "MT EPS Question Factory Server" /min cmd /k "cd /d "%~dp0" && npm run dev"
 
 for /L %%I in (1,1,60) do (
