@@ -9,8 +9,10 @@ async function jsonApi<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 function friendly(text: string) {
-  if (/429|quota|RESOURCE_EXHAUSTED/i.test(text)) return 'AI generation/QA provider quota is limited right now. YouTube analysis does not use Gemini anymore; the Controller will wait/fallback between Gemini and GLM.';
-  return text.length > 420 ? `${text.slice(0, 417)}...` : text;
+  if (/authentication failed|HTTP 401/i.test(text)) return 'GLM authentication failed (HTTP 401). This is not quota. Replace/check the GLM/NVIDIA key or endpoint in API Keys. The Controller will stop retrying that invalid provider during this run.';
+  if (/daily quota/i.test(text)) return 'The provider explicitly reported a daily quota limit. This label is shown only when the API response contains a per-day quota signal.';
+  if (/temporary rate limit|HTTP 429|RESOURCE_EXHAUSTED/i.test(text)) return 'Temporary provider rate limit (HTTP 429). The Controller will use Retry-After/cooldown and fallback; this is not automatically treated as a daily quota.';
+  return text.length > 520 ? `${text.slice(0, 517)}...` : text;
 }
 
 const workerAgents: AgentName[] = ['Form Agent', 'Structure Agent', 'Media Agent', 'Alignment Agent', 'Generator Agent', 'QA Agent'];
@@ -92,13 +94,13 @@ export function OneClickBuild() {
 
   const percent = starting && !job ? 1 : job?.percent ?? 0;
   const running = starting || !!job && ['queued', 'running'].includes(job.status);
-  const recentLogs = job?.logs.slice(-8).reverse() ?? [];
+  const recentLogs = job?.logs.slice(-10).reverse() ?? [];
   const summary = job?.summary;
 
   return <aside className={`one-click-build ${running ? 'running' : ''}`}>
     <div className="one-click-head">
       <div>
-        <span className="one-click-badge">CONTROLLER AGENTS v0.5.2</span>
+        <span className="one-click-badge">CONTROLLER AGENTS v0.5.3</span>
         <strong>Answered Google Form → Reading 20 → Listening 20 → Fresh 40Q</strong>
       </div>
       <button className="one-click-minimize" onClick={() => setMinimized(true)} aria-label="Minimize">—</button>
@@ -142,6 +144,6 @@ export function OneClickBuild() {
     </div>)}</div>}
 
     {error && <div className="one-click-error">{friendly(error)}</div>}
-    <small>Normal use is one link + one button. YouTube analysis is local-only: yt-dlp captions first, Whisper fallback, local timestamp matching, then FFmpeg clip. Gemini/GLM are reserved for question generation and semantic QA. Review happens only after 40/40 if you want it.</small>
+    <small>Provider errors are now classified exactly: AUTH 401/403, temporary 429, daily quota 429, or model quota. Sanitized details are saved locally in data/diagnostics/provider-errors.jsonl. YouTube analysis stays AI-free.</small>
   </aside>;
 }
