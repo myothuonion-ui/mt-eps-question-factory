@@ -1,31 +1,57 @@
 import { randomUUID } from 'node:crypto';
-import type { ExamSet, ExamSlot, ImportAnalysis, NormalizedQuestion, QuestionType } from '../src/shared/types.js';
+import type { ExamSection, ExamSet, ExamSlot, ImportAnalysis, NormalizedQuestion, QuestionType } from '../src/shared/types.js';
 import { generateQuestionBatch, type GenerationSpec } from './providers/aiProvider.js';
 import { finalizeListeningSlots, prepareListeningReferences } from './listeningPipeline.js';
 import { runQaForSet } from './qa.js';
 import { getProviderSettings } from './providerSettings.js';
 import type { ProgressEvent } from './jobManager.js';
 
-function defaultReadingType(slot: number): QuestionType {
-  const index = slot - 20;
-  if (index <= 5) return 'vocabulary';
-  if (index <= 10) return 'blank';
-  if (index <= 14) return 'grammar';
+function defaultReadingType(readingIndex: number): QuestionType {
+  if (readingIndex <= 5) return 'vocabulary';
+  if (readingIndex <= 10) return 'blank';
+  if (readingIndex <= 14) return 'grammar';
   return 'reading';
+}
+
+function standardSectionPlan(): ExamSection[] {
+  return Array.from({ length: 40 }, (_, index) => index < 20 ? 'reading' : 'listening');
+}
+
+function resolvedSectionPlan(analysis?: ImportAnalysis | null) {
+  const plan = analysis?.sectionPlan?.slice(0, 40) ?? [];
+  if (plan.length === 40 && plan.every(section => section === 'reading' || section === 'listening')) return plan;
+  return standardSectionPlan();
 }
 
 export function createBlueprint(analysis?: ImportAnalysis | null, includeImportedQuestions = true): ExamSlot[] {
   const ordered = [...(analysis?.questions ?? [])].sort((a, b) => a.sourceOrder - b.sourceOrder);
+  const plan = resolvedSectionPlan(analysis);
+  let readingIndex = 0;
+  let listeningIndex = 0;
+
   return Array.from({ length: 40 }, (_, index) => {
     const slot = index + 1;
     const source = ordered[index] ?? null;
-    const section = slot <= 20 ? 'listening' : 'reading';
-    const expectedType: QuestionType = source?.type && source.type !== 'unknown'
-      ? source.type
-      : section === 'listening' ? 'listening' : defaultReadingType(slot);
-    const patternId = `${section === 'listening' ? 'L' : 'R'}${String(section === 'listening' ? slot : slot - 20).padStart(2, '0')}`;
+    const section = plan[index];
+    if (section === 'reading') readingIndex += 1;
+    else listeningIndex += 1;
+    const sectionIndex = section === 'reading' ? readingIndex : listeningIndex;
+    const expectedType: QuestionType = section === 'listening'
+      ? 'listening'
+      : source?.type && !['unknown', 'listening'].includes(source.type)
+        ? source.type
+        : defaultReadingType(sectionIndex);
+    const patternId = `${section === 'listening' ? 'L' : 'R'}${String(sectionIndex).padStart(2, '0')}`;
     const imported = includeImportedQuestions && source
-      ? { ...source, patternId, origin: source.origin ?? 'imported' as const, reviewState: source.reviewState ?? 'not_reviewed' as const, revision: source.revision ?? 1 }
+      ? {
+          ...source,
+          section,
+          type: expectedType,
+          patternId,
+          origin: source.origin ?? 'imported' as const,
+          reviewState: source.reviewState ?? 'not_reviewed' as const,
+          revision: source.revision ?? 1
+        }
       : null;
     return { slot, section, patternId, expectedType, question: imported, generationRequired: !imported } satisfies ExamSlot;
   });
@@ -44,7 +70,7 @@ function chapterForSlot(slot: number, analysis: ImportAnalysis) {
 function examplesFor(slot: ExamSlot, questions: NormalizedQuestion[]) {
   const exact = questions.find(q => q.sourceOrder === slot.slot);
   const sameType = questions.filter(q => q.type === slot.expectedType);
-  const sameSection = questions.filter(q => slot.section === 'listening' ? q.type === 'listening' : q.type !== 'listening');
+  const sameSection = questions.filter(q => (q.section ?? (q.type === 'listening' ? 'listening' : 'reading')) === slot.section);
   return [exact, ...sameType, ...sameSection]
     .filter((q): q is NormalizedQuestion => !!q)
     .filter((q, i, arr) => arr.findIndex(item => item.id === q.id) === i)
@@ -56,33 +82,34 @@ type Reporter = (event: ProgressEvent) => void;
 export async function complete40QuestionSet(analysis: ImportAnalysis, name?: string, report?: Reporter): Promise<ExamSet> {
   const slots = createBlueprint(analysis, false);
   const specs: GenerationSpec[] = [];
-  report?.({ stage: 'prepare', percent: 2, question: null, completedQuestions: 0, message: `Preparing 40 slots from ${analysis.questions.length} analyzed source questions.` });
+  report?.({
+    stage: 'prepare', agent: 'Controller Agent', percent: 19, question: null, completedQuestions: 0,
+    message: `Preparing 40 slots from ${analysis.questions.length} source reference(s): Reading ${slots.filter(s => s.section === 'reading').length} → Listening ${slots.filter(s => s.section === 'listening').length}.`
+  });
 
   const listeningReferences = analysis.questions
-    .filter(question => question.sourceOrder <= 20)
+    .filter(question => (question.section ?? (question.type === 'listening' ? 'listening' : 'reading')) === 'listening')
     .filter(question => question.media?.some(item => item.kind === 'youtube'));
   const uniqueYoutubeCount = new Set(listeningReferences.flatMap(question => question.media.filter(item => item.kind === 'youtube').map(item => item.url))).size;
+
   const preparedByReference = listeningReferences.length
-    ? await prepareListeningReferences(listeningReferences, (question, message, level = 'info') => {
+    ? await prepareListeningReferences(listeningReferences, (question, message, level = 'info', agent = 'Media Agent') => {
         report?.({
-          stage: 'prepare',
-          percent: 3 + ((question ?? 1) / 20) * 7,
-          question,
-          completedQuestions: 0,
-          level,
-          message
+          stage: 'prepare', agent, percent: 20 + ((Math.max(1, question ?? 21) - 20) / 20) * 20,
+          question, completedQuestions: 0, level, message
         });
       })
     : new Map();
 
   if (listeningReferences.length) {
     report?.({
-      stage: 'prepare',
-      percent: 10,
-      question: null,
-      completedQuestions: 0,
-      level: 'success',
-      message: `Hybrid listening preparation finished for ${uniqueYoutubeCount} unique YouTube source(s); cached results will be reused across Q1–Q20.`
+      stage: 'prepare', agent: 'Media Agent', percent: 40, question: null, completedQuestions: 0, level: 'success',
+      message: `Listening preparation finished for ${uniqueYoutubeCount} unique YouTube source(s). Video/caption results are cached and reused across Listening questions.`
+    });
+  } else {
+    report?.({
+      stage: 'prepare', agent: 'Media Agent', percent: 40, question: null, completedQuestions: 0, level: 'warn',
+      message: 'No per-question YouTube source was attached after Form analysis. Listening questions will use generated scripts/TTS and keep a QA flag for missing source grounding.'
     });
   }
 
@@ -90,7 +117,6 @@ export async function complete40QuestionSet(analysis: ImportAnalysis, name?: str
     const chapter = chapterForSlot(slot.slot, analysis);
     const reference = analysis.questions.find(item => item.sourceOrder === slot.slot);
     const hasOwnedMedia = slot.section === 'listening' && !!reference?.media?.some(item => item.kind === 'youtube' || item.kind === 'audio' || item.kind === 'video');
-    report?.({ stage: 'prepare', percent: 10, question: slot.slot, completedQuestions: 0, message: `Q${slot.slot}: pattern ${slot.patternId}, Chapter ${chapter}, ${slot.expectedType}.` });
     const prepared = reference ? preparedByReference.get(reference.id) ?? null : null;
     specs.push({
       slot: slot.slot,
@@ -110,17 +136,16 @@ export async function complete40QuestionSet(analysis: ImportAnalysis, name?: str
     const batch = specs.slice(start, start + batchSize);
     const qStart = batch[0].slot;
     const qEnd = batch[batch.length - 1].slot;
-    report?.({ stage: 'generation', percent: 10 + (completed / 40) * 60, question: qStart, completedQuestions: completed, message: `Generating Q${qStart}–Q${qEnd} as one API batch (${Math.ceil((start + 1) / batchSize)}/${Math.ceil(40 / batchSize)}).` });
+    report?.({
+      stage: 'generation', agent: 'Generator Agent', percent: 41 + (completed / 40) * 35,
+      question: qStart, completedQuestions: completed,
+      message: `Generating Q${qStart}–Q${qEnd} as one API batch (${Math.floor(start / batchSize) + 1}/${Math.ceil(40 / batchSize)}).`
+    });
     const generated = await generateQuestionBatch(batch, attempt => {
       report?.({
-        stage: 'generation',
-        percent: 10 + (completed / 40) * 60,
-        question: qStart,
-        completedQuestions: completed,
-        provider: attempt.provider,
-        fallback: attempt.fallback,
-        level: attempt.level,
-        message: attempt.message
+        stage: 'generation', agent: 'Generator Agent', percent: 41 + (completed / 40) * 35,
+        question: qStart, completedQuestions: completed, provider: attempt.provider,
+        fallback: attempt.fallback, level: attempt.level, message: attempt.message
       });
     });
 
@@ -130,35 +155,55 @@ export async function complete40QuestionSet(analysis: ImportAnalysis, name?: str
       const slot = slots[spec.slot - 1];
       const reference = analysis.questions.find(item => item.sourceOrder === spec.slot);
       const prepared = reference ? preparedByReference.get(reference.id) ?? null : null;
+      question.section = slot.section;
+      question.type = slot.expectedType;
       if (slot.section === 'listening' && reference?.media?.length) {
         question.media = reference.media.filter(item => item.kind === 'youtube' || item.kind === 'audio' || item.kind === 'video');
         question.provenance.sourceQuestionId = reference.id;
         question.provenance.sourceUrl = reference.provenance.sourceUrl;
         question.provenance.sourceTitle = reference.provenance.sourceTitle;
         if (prepared?.audioAsset) question.audioAsset = prepared.audioAsset;
-        if (prepared?.flags.length) question.qaFlags = [...new Set([...question.qaFlags, ...prepared.flags])];
-        if (!question.listeningScript?.length && prepared?.transcript) {
-          question.listeningScript = [{ speaker: 'narrator', text: prepared.transcript.slice(0, 1800) }];
-          question.qaFlags = [...new Set([...question.qaFlags, 'TTS_FALLBACK_SCRIPT_FROM_SOURCE_TRANSCRIPT'])];
+        if (prepared?.transcript && !question.listeningScript?.length) {
+          question.listeningScript = [{ speaker: 'narrator', text: prepared.transcript }];
+          question.qaFlags = [...new Set([...question.qaFlags, 'GROUNDED_TRANSCRIPT_TTS_FALLBACK'])];
         }
+        if (prepared?.flags.length) question.qaFlags = [...new Set([...question.qaFlags, ...prepared.flags])];
       }
       slot.question = question;
       slot.generationRequired = false;
       completed += 1;
-      report?.({ stage: 'generation', percent: 10 + (completed / 40) * 60, question: spec.slot, completedQuestions: completed, provider: question.generatedBy ?? 'unknown', level: 'success', message: `Q${spec.slot}: generated successfully with ${question.generatedBy ?? 'AI'}.` });
+      report?.({
+        stage: 'generation', agent: 'Generator Agent', percent: 41 + (completed / 40) * 35,
+        question: spec.slot, completedQuestions: completed, provider: question.generatedBy ?? 'unknown', level: 'success',
+        message: `Q${spec.slot} ${slot.section === 'reading' ? 'Reading' : 'Listening'}: generated with ${question.generatedBy ?? 'AI'}.`
+      });
     }
   }
 
-  report?.({ stage: 'listening', percent: 72, question: 1, completedQuestions: 40, message: 'Finalizing listening audio for Q1–Q20. Prepared source clips are reused; TTS is fallback only.' });
-  await finalizeListeningSlots(slots, (question, message, level = 'info') => {
-    const percent = 72 + (Math.min(20, Math.max(1, question)) / 20) * 15;
-    report?.({ stage: 'listening', percent, question, completedQuestions: 40, level, message });
+  const listeningSlots = slots.filter(slot => slot.section === 'listening');
+  report?.({
+    stage: 'listening', agent: 'Media Agent', percent: 78, question: listeningSlots[0]?.slot ?? null, completedQuestions: 40,
+    message: `Finalizing audio for ${listeningSlots.length} Listening question(s). Prepared source clips are preferred; grounded TTS is fallback.`
+  });
+  let audioProgress = 0;
+  await finalizeListeningSlots(slots, (question, message, level = 'info', agent = 'Media Agent') => {
+    audioProgress += level === 'success' ? 1 : 0;
+    const percent = 78 + (Math.min(listeningSlots.length, Math.max(1, audioProgress || 1)) / Math.max(1, listeningSlots.length)) * 11;
+    report?.({ stage: 'listening', agent, percent, question, completedQuestions: 40, level, message });
   });
 
-  report?.({ stage: 'qa', percent: 88, question: null, completedQuestions: 40, message: 'Running answer, structure and duplicate QA across all 40 questions.' });
+  report?.({
+    stage: 'qa', agent: 'QA Agent', percent: 90, question: null, completedQuestions: 40,
+    message: 'Running answer, four-choice, section, audio and duplicate QA across all 40 generated questions.'
+  });
   const qaSlots = runQaForSet(slots);
   qaSlots.forEach((slot, index) => {
-    report?.({ stage: 'qa', percent: 88 + ((index + 1) / 40) * 8, question: slot.slot, completedQuestions: 40, level: slot.question?.qa?.passed ? 'success' : 'warn', message: `Q${slot.slot}: QA ${slot.question?.qa?.score ?? 0}%${slot.question?.qaFlags?.length ? ` · ${slot.question.qaFlags.join(', ')}` : ''}.` });
+    report?.({
+      stage: 'qa', agent: 'QA Agent', percent: 90 + ((index + 1) / 40) * 7,
+      question: slot.slot, completedQuestions: 40,
+      level: slot.question?.qa?.passed ? 'success' : 'warn',
+      message: `Q${slot.slot}: QA ${slot.question?.qa?.score ?? 0}%${slot.question?.qaFlags?.length ? ` · ${slot.question.qaFlags.join(', ')}` : ''}.`
+    });
   });
 
   return {
