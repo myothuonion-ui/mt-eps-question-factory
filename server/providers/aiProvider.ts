@@ -11,6 +11,12 @@ import {
   waitForCooldown,
   waitForProviderSlot
 } from './requestQueue.js';
+import {
+  appendProviderDiagnostic,
+  classifyProviderHttpError,
+  classifyUnknownProviderError,
+  type ProviderErrorDetails
+} from './providerDiagnostics.js';
 
 export type GenerationSpec = {
   slot: number;
@@ -43,6 +49,14 @@ type AiQuestionPayload = {
 
 type ProviderName = 'gemini' | 'glm' | 'mock';
 type RealProviderName = Exclude<ProviderName, 'mock'>;
+
+type ProviderFailure = Error & {
+  status?: number;
+  retryAfterMs?: number;
+  details?: ProviderErrorDetails;
+};
+
+const authDisabledUntil: Record<RealProviderName, number> = { gemini: 0, glm: 0 };
 
 function jsonValue(text: string) {
   const cleaned = text.replace(/```(?:json)?/gi, '').replace(/```/g, '').trim();
@@ -133,24 +147,18 @@ function validateBatch(raw: unknown, specs: GenerationSpec[]) {
   return specs.map((spec, index) => bySlot.get(spec.slot) ?? payloads[index]);
 }
 
-function retryAfterFromResponse(response: Response, body: string) {
-  const raw = response.headers.get('retry-after');
-  if (raw) {
-    const seconds = Number(raw);
-    if (Number.isFinite(seconds) && seconds > 0) return seconds * 1000;
-    const date = Date.parse(raw);
-    if (Number.isFinite(date) && date > Date.now()) return date - Date.now();
-  }
-  const match = body.match(/"retryDelay"\s*:\s*"([0-9]+(?:\.[0-9]+)?)s"/i)
-    ?? body.match(/retry(?:Delay|[_ -]?after| in)[^0-9]{0,20}([0-9]+(?:\.[0-9]+)?)\s*s/i);
-  return match ? Math.ceil(Number(match[1]) * 1000) : 0;
-}
-
-function providerHttpError(provider: string, response: Response, body: string) {
-  const error = new Error(`${provider} failed: HTTP ${response.status} ${body}`);
-  (error as any).status = response.status;
-  const retryAfter = retryAfterFromResponse(response, body);
-  if (retryAfter > 0) (error as any).retryAfterMs = retryAfter;
+function providerHttpError(provider: RealProviderName, model: string, response: Response, body: string): ProviderFailure {
+  const details = classifyProviderHttpError({
+    provider,
+    model,
+    status: response.status,
+    body,
+    retryAfterHeader: response.headers.get('retry-after')
+  });
+  const error = new Error(`${provider.toUpperCase()} failed: HTTP ${response.status} ${details.message}`) as ProviderFailure;
+  error.status = response.status;
+  error.retryAfterMs = details.retryAfterMs;
+  error.details = details;
   return error;
 }
 
@@ -168,7 +176,7 @@ async function callGemini(specs: GenerationSpec[]) {
   });
   if (!response.ok) {
     const text = await response.text();
-    throw providerHttpError('Gemini', response, text);
+    throw providerHttpError('gemini', settings.gemini.model, response, text);
   }
   const json = await response.json() as any;
   const text = json?.candidates?.[0]?.content?.parts?.map((part: any) => part?.text ?? '').join('');
@@ -192,7 +200,7 @@ async function callGlm(specs: GenerationSpec[]) {
   });
   if (!response.ok) {
     const text = await response.text();
-    throw providerHttpError('GLM', response, text);
+    throw providerHttpError('glm', settings.glm.model, response, text);
   }
   const json = await response.json() as any;
   const text = json?.choices?.[0]?.message?.content;
@@ -234,17 +242,44 @@ function configured(provider: ProviderName) {
   return true;
 }
 
+function modelFor(provider: RealProviderName) {
+  const settings = getProviderSettings();
+  return provider === 'gemini' ? settings.gemini.model : settings.glm.model;
+}
+
 async function callProvider(provider: ProviderName, specs: GenerationSpec[]) {
   if (provider === 'gemini') return callGemini(specs);
   if (provider === 'glm') return callGlm(specs);
   return specs.map(mockPayload);
 }
 
+function authDisabledMs(provider: RealProviderName) {
+  return Math.max(0, authDisabledUntil[provider] - Date.now());
+}
+
+function errorDetails(provider: RealProviderName, error: unknown): ProviderErrorDetails {
+  const attached = (error as ProviderFailure)?.details;
+  return attached ?? classifyUnknownProviderError(provider, modelFor(provider), error);
+}
+
 function shortError(error: unknown) {
+  const details = (error as ProviderFailure)?.details;
+  if (details) {
+    const prefix = details.provider.toUpperCase();
+    if (details.classification === 'AUTH_401' || details.classification === 'AUTH_403') {
+      return `${prefix} API authentication failed (HTTP ${details.status}). Check that this key belongs to the configured endpoint.`;
+    }
+    if (details.classification === 'DAILY_QUOTA_429') {
+      return `${prefix} daily quota reached (HTTP 429)${details.quotaId ? ` · ${details.quotaId}` : ''}.`;
+    }
+    if (details.classification === 'TEMP_RATE_LIMIT_429') {
+      return `${prefix} temporary rate limit (HTTP 429)${details.retryAfterMs ? ` · retry after ${Math.ceil(details.retryAfterMs / 1000)}s` : ''}.`;
+    }
+    if (details.classification === 'MODEL_QUOTA_429') return `${prefix} model quota reached (HTTP 429).`;
+    return `${prefix} ${details.classification}${details.status ? ` · HTTP ${details.status}` : ''} · ${details.message}`;
+  }
   const text = error instanceof Error ? error.message : String(error);
-  if (/Gemini failed: HTTP 429/i.test(text)) return 'Gemini is temporarily rate-limited (HTTP 429).';
-  if (/GLM failed: HTTP 429|Too Many Requests/i.test(text)) return 'GLM is temporarily rate-limited (HTTP 429).';
-  return text.length > 260 ? `${text.slice(0, 257)}...` : text;
+  return text.length > 280 ? `${text.slice(0, 277)}...` : text;
 }
 
 function toQuestion(spec: GenerationSpec, payload: AiQuestionPayload, provider: string): NormalizedQuestion {
@@ -308,93 +343,100 @@ export async function generateQuestionBatch(specs: GenerationSpec[], onAttempt?:
     return specs.map(spec => toQuestion(spec, mockPayload(spec), 'mock'));
   }
 
-  const realProviders = sequence.filter((provider): provider is RealProviderName => provider !== 'mock' && configured(provider));
-  if (!realProviders.length) throw new Error('No AI provider is configured. Add Gemini or GLM in API Keys.');
+  const configuredProviders = sequence.filter((provider): provider is RealProviderName => provider !== 'mock' && configured(provider));
+  if (!configuredProviders.length) throw new Error('No AI provider is configured. Add Gemini or GLM in API Keys.');
 
   const startedAt = Date.now();
   let lastError: unknown = null;
   let cycle = 0;
+  const attempts: Record<RealProviderName, number> = { gemini: 0, glm: 0 };
 
   while (Date.now() - startedAt < maxRateLimitWaitMs()) {
     cycle += 1;
-    let sawRateLimit = false;
+    let sawWaitableProvider = false;
     let attemptedProvider = false;
 
     for (let index = 0; index < sequence.length; index += 1) {
       const provider = sequence[index];
-      if (provider === 'mock') continue;
-      if (!configured(provider)) {
-        onAttempt?.({ provider, fallback: index > 0, level: 'warn', message: `${provider.toUpperCase()} is not configured; skipping it.` });
+      if (provider === 'mock' || !configured(provider)) continue;
+
+      const authWait = authDisabledMs(provider);
+      if (authWait > 0) {
+        onAttempt?.({
+          provider,
+          fallback: true,
+          level: 'warn',
+          message: `${provider.toUpperCase()} disabled for this run after authentication failure. Fix its API key in API Keys; skipping it for ${Math.ceil(authWait / 1000)}s.`
+        });
         continue;
       }
 
       const cooldown = providerCooldownMs(provider);
       if (cooldown > 0) {
-        sawRateLimit = true;
-        onAttempt?.({
-          provider,
-          fallback: true,
-          level: 'info',
-          message: `${provider.toUpperCase()} is cooling down. Checking another provider first; ${Math.ceil(cooldown / 1000)}s remain.`
-        });
+        sawWaitableProvider = true;
+        onAttempt?.({ provider, fallback: true, level: 'info', message: `${provider.toUpperCase()} cooldown · ${Math.ceil(cooldown / 1000)}s remain. Checking another provider first.` });
         continue;
       }
 
       attemptedProvider = true;
+      attempts[provider] += 1;
       try {
         await waitForProviderSlot(provider, (seconds, reason) => {
-          onAttempt?.({
-            provider,
-            fallback: index > 0,
-            level: 'info',
-            message: `Queue · ${reason}. Waiting ${seconds}s before Q${specs[0].slot}–Q${specs[specs.length - 1].slot}.`
-          });
+          onAttempt?.({ provider, fallback: index > 0, level: 'info', message: `Queue · ${reason}. Waiting ${seconds}s before Q${specs[0].slot}–Q${specs[specs.length - 1].slot}.` });
         });
         onAttempt?.({ provider, fallback: index > 0, level: 'info', message: `Using ${provider.toUpperCase()} for Q${specs[0].slot}–Q${specs[specs.length - 1].slot}.` });
         const payloads = await callProvider(provider, specs);
         clearRateLimit(provider);
+        authDisabledUntil[provider] = 0;
         return specs.map((spec, i) => toQuestion(spec, payloads[i], provider));
       } catch (error) {
         lastError = error;
-        if (isRateLimitError(error)) {
-          sawRateLimit = true;
-          const cooldownMs = registerRateLimit(provider, error);
-          const hasOther = realProviders.some(other => other !== provider && providerCooldownMs(other) === 0);
-          onAttempt?.({
-            provider,
-            fallback: true,
-            level: 'warn',
-            message: `${shortError(error)} ${provider.toUpperCase()} paused for ${Math.ceil(cooldownMs / 1000)}s.${hasOther ? ' Trying the next provider now.' : ''}`
-          });
+        const details = errorDetails(provider, error);
+        await appendProviderDiagnostic(details, specs[0]?.slot ?? null, specs[specs.length - 1]?.slot ?? null, attempts[provider]);
+
+        if (details.classification === 'AUTH_401' || details.classification === 'AUTH_403') {
+          authDisabledUntil[provider] = Date.now() + 10 * 60_000;
+          const otherAvailable = configuredProviders.some(other => other !== provider && authDisabledMs(other) === 0);
+          sawWaitableProvider = otherAvailable && configuredProviders.some(other => other !== provider && providerCooldownMs(other) > 0);
+          onAttempt?.({ provider, fallback: otherAvailable, level: 'warn', message: `${shortError(error)} ${otherAvailable ? 'This provider is disabled for the current run; the Controller will use/wait for the other provider.' : 'No other authenticated provider is available.'}` });
           continue;
         }
 
-        const hasNext = sequence.slice(index + 1).some(item => item !== 'mock' && configured(item));
+        if (isRateLimitError(error)) {
+          sawWaitableProvider = true;
+          const cooldownMs = registerRateLimit(provider, error);
+          const hasOther = configuredProviders.some(other => other !== provider && authDisabledMs(other) === 0 && providerCooldownMs(other) === 0);
+          onAttempt?.({ provider, fallback: true, level: 'warn', message: `${shortError(error)} ${provider.toUpperCase()} cooldown ${Math.ceil(cooldownMs / 1000)}s.${hasOther ? ' Trying the next provider now.' : ''}` });
+          continue;
+        }
+
+        const hasNext = configuredProviders.some(other => other !== provider && authDisabledMs(other) === 0);
         onAttempt?.({ provider, fallback: hasNext, level: 'warn', message: `${shortError(error)}${hasNext ? ' Falling back automatically.' : ''}` });
         if (!hasNext) throw error;
       }
     }
 
-    if (!sawRateLimit) break;
+    const usable = configuredProviders.filter(provider => authDisabledMs(provider) === 0);
+    if (!usable.length) {
+      throw new Error('All configured AI providers failed authentication. Open API Keys and replace the invalid key(s). See API Diagnostic Log for exact HTTP status and provider response.');
+    }
 
-    const waitMs = earliestCooldownMs(realProviders);
-    if (waitMs <= 0 && attemptedProvider) continue;
+    if (!sawWaitableProvider) {
+      if (attemptedProvider) continue;
+      break;
+    }
+
+    const waitMs = earliestCooldownMs(usable);
+    if (waitMs <= 0) continue;
     const elapsed = Date.now() - startedAt;
     if (elapsed + waitMs > maxRateLimitWaitMs()) break;
 
-    onAttempt?.({
-      provider: 'queue',
-      fallback: true,
-      level: 'info',
-      message: `All configured AI providers are rate-limited. Job is paused, not failed. Retrying in ${Math.max(1, Math.ceil(waitMs / 1000))}s (queue cycle ${cycle}).`
-    });
+    onAttempt?.({ provider: 'queue', fallback: true, level: 'info', message: `Provider wait · retrying in ${Math.max(1, Math.ceil(waitMs / 1000))}s (queue cycle ${cycle}). This is not treated as a daily quota unless the provider response explicitly says per-day.` });
     await waitForCooldown(waitMs);
   }
 
   const raw = shortError(lastError ?? new Error('AI providers did not become available.'));
-  if (isRateLimitError(lastError)) {
-    throw new Error(`${raw} The job waited for provider cooldowns but the configured APIs stayed rate-limited. Retry later or use another API key/provider.`);
-  }
+  if (isRateLimitError(lastError)) throw new Error(`${raw} The configured provider remained limited beyond the job wait window. See API Diagnostic Log for the exact quota/rate-limit classification.`);
   throw new Error(raw);
 }
 
