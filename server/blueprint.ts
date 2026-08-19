@@ -137,6 +137,10 @@ export async function complete40QuestionSet(analysis: ImportAnalysis, name?: str
         question.provenance.sourceTitle = reference.provenance.sourceTitle;
         if (prepared?.audioAsset) question.audioAsset = prepared.audioAsset;
         if (prepared?.flags.length) question.qaFlags = [...new Set([...question.qaFlags, ...prepared.flags])];
+        if (!question.listeningScript?.length && prepared?.transcript) {
+          question.listeningScript = [{ speaker: 'narrator', text: prepared.transcript.slice(0, 1800) }];
+          question.qaFlags = [...new Set([...question.qaFlags, 'TTS_FALLBACK_SCRIPT_FROM_SOURCE_TRANSCRIPT'])];
+        }
       }
       slot.question = question;
       slot.generationRequired = false;
