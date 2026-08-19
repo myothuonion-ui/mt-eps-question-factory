@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { AgentName, AudioAsset, ExamSlot, MediaAnalysis, MediaSegment, NormalizedQuestion } from '../src/shared/types.js';
 import { analyzeYoutube, cutAudioSegment, downloadYoutubeAudio, extractYoutubeCaptions } from './mediaProcessor.js';
-import { alignQuestionsWithYoutube, type VideoAlignment } from './geminiVideo.js';
 import { listVoiceProfiles } from './store.js';
 import { generateListeningAudio } from './tts.js';
 
@@ -23,6 +22,15 @@ function textSimilarity(a: string, b: string) {
   return common / Math.max(aa.size, bb.size);
 }
 
+function weightedQuestionSimilarity(question: NormalizedQuestion, transcript: string) {
+  const answer = question.correctAnswerIndex !== null ? question.options[question.correctAnswerIndex] ?? '' : '';
+  const answerScore = textSimilarity(answer, transcript);
+  const stemScore = textSimilarity(question.stem, transcript);
+  const optionScore = Math.max(0, ...question.options.map(option => textSimilarity(option, transcript)));
+  // In EPS listening items the spoken wording often overlaps the correct option more than the question stem.
+  return (answerScore * 0.58) + (stemScore * 0.24) + (optionScore * 0.18);
+}
+
 function questionTarget(question: NormalizedQuestion) {
   return [question.stem, question.correctAnswerIndex !== null ? question.options[question.correctAnswerIndex] : '', ...question.options].join(' ');
 }
@@ -34,6 +42,88 @@ function transcriptForRange(segments: MediaSegment[], start: number, end: number
     .filter((text, index, arr) => arr[index - 1] !== text)
     .join(' ')
     .trim();
+}
+
+type LocalAlignment = {
+  segment: MediaSegment | null;
+  confidence: number;
+  guessed: boolean;
+  method: 'caption-text' | 'whisper-text' | 'ordered-fallback';
+};
+
+function buildCandidateWindows(segments: MediaSegment[]) {
+  if (!segments.length) return [] as MediaSegment[];
+  const out: MediaSegment[] = [];
+  for (let index = 0; index < segments.length; index += 1) {
+    const current = segments[index];
+    const startIndex = Math.max(0, index - 1);
+    for (let endIndex = index; endIndex <= Math.min(segments.length - 1, index + 3); endIndex += 1) {
+      const first = segments[startIndex];
+      const last = segments[endIndex];
+      const start = Math.max(0, first.start);
+      const end = Math.min(last.end, start + 45);
+      if (end <= start || end - start < 2) continue;
+      const text = transcriptForRange(segments, start, end);
+      out.push({
+        id: `WIN-${startIndex}-${endIndex}`,
+        start,
+        end,
+        text: text || current.text || '',
+        score: 0
+      });
+    }
+  }
+  const deduped = new Map<string, MediaSegment>();
+  for (const segment of out) deduped.set(`${segment.start.toFixed(2)}:${segment.end.toFixed(2)}`, segment);
+  return [...deduped.values()];
+}
+
+function localAlignQuestions(questions: NormalizedQuestion[], segments: MediaSegment[], source: 'caption' | 'whisper') {
+  const result = new Map<string, LocalAlignment>();
+  if (!questions.length || !segments.length) return result;
+  const orderedQuestions = [...questions].sort((a, b) => a.sourceOrder - b.sourceOrder);
+  const windows = buildCandidateWindows(segments);
+  if (!windows.length) return result;
+  const videoStart = Math.min(...segments.map(segment => segment.start));
+  const videoEnd = Math.max(...segments.map(segment => segment.end));
+  const duration = Math.max(1, videoEnd - videoStart);
+  let previousStart = videoStart - 1;
+
+  for (let qIndex = 0; qIndex < orderedQuestions.length; qIndex += 1) {
+    const question = orderedQuestions[qIndex];
+    const expectedCenter = videoStart + duration * ((qIndex + 0.5) / orderedQuestions.length);
+    const monotonic = windows.filter(window => window.start >= previousStart - 1.5);
+    const pool = monotonic.length ? monotonic : windows;
+    const ranked = pool.map(window => {
+      const lexical = weightedQuestionSimilarity(question, window.text ?? '');
+      const center = (window.start + window.end) / 2;
+      const position = Math.max(0, 1 - Math.abs(center - expectedCenter) / Math.max(1, duration * 0.45));
+      const reusePenalty = window.start < previousStart + 1 ? 0.07 : 0;
+      const combined = (lexical * 0.84) + (position * 0.16) - reusePenalty;
+      return { window, lexical, position, combined };
+    }).sort((a, b) => b.combined - a.combined);
+    const winner = ranked[0];
+    if (!winner) continue;
+
+    const lexicalEnough = winner.lexical >= 0.035;
+    const confidence = lexicalEnough
+      ? Math.min(0.97, 0.55 + winner.lexical * 2.2 + winner.position * 0.12)
+      : Math.min(0.54, 0.28 + winner.position * 0.24);
+    const guessed = !lexicalEnough;
+    const segment: MediaSegment = {
+      ...winner.window,
+      id: `SEG-${randomUUID()}`,
+      score: confidence
+    };
+    result.set(question.id, {
+      segment,
+      confidence,
+      guessed,
+      method: guessed ? 'ordered-fallback' : source === 'caption' ? 'caption-text' : 'whisper-text'
+    });
+    previousStart = Math.max(previousStart, segment.start);
+  }
+  return result;
 }
 
 function bestSegment(question: NormalizedQuestion, segments: MediaSegment[]): { segment: MediaSegment | null; guessed: boolean } {
@@ -83,7 +173,6 @@ async function cachedAudioPath(url: string) {
 
 function shortError(error: unknown) {
   const text = error instanceof Error ? error.message : String(error);
-  if (/HTTP 429|quota|RESOURCE_EXHAUSTED/i.test(text)) return 'Gemini video quota reached; continuing with captions/Whisper fallback.';
   return text.length > 220 ? `${text.slice(0, 217)}...` : text;
 }
 
@@ -100,10 +189,6 @@ function youtubeFor(question: NormalizedQuestion) {
   return question.media.find(media => media.kind === 'youtube')?.url ?? null;
 }
 
-function validAlignment(alignment: VideoAlignment | undefined) {
-  return !!alignment && alignment.end > alignment.start && alignment.end - alignment.start <= 60 && alignment.confidence >= 0.55;
-}
-
 export async function prepareListeningReferences(references: NormalizedQuestion[], report?: HybridReporter) {
   const result = new Map<string, PreparedListeningReference>();
   const groups = new Map<string, NormalizedQuestion[]>();
@@ -116,72 +201,78 @@ export async function prepareListeningReferences(references: NormalizedQuestion[
   let videoIndex = 0;
   for (const [url, questions] of groups) {
     videoIndex += 1;
-    report?.(questions[0]?.sourceOrder ?? null, `YouTube ${videoIndex}/${groups.size}: checking captions once for ${questions.length} Listening question(s).`, 'info', 'Media Agent');
+    const orderedQuestions = [...questions].sort((a, b) => a.sourceOrder - b.sourceOrder);
+    report?.(orderedQuestions[0]?.sourceOrder ?? null, `YouTube ${videoIndex}/${groups.size}: local-only analysis for ${orderedQuestions.length} Listening question(s). No AI video request will be used.`, 'info', 'Media Agent');
+
     let captions: MediaSegment[] = [];
     try {
       captions = await cachedCaptions(url);
       report?.(
-        questions[0]?.sourceOrder ?? null,
-        captions.length ? `YouTube ${videoIndex}/${groups.size}: ${captions.length} timestamped caption segment(s) found.` : `YouTube ${videoIndex}/${groups.size}: no usable captions; semantic/fallback analysis will continue.`,
+        orderedQuestions[0]?.sourceOrder ?? null,
+        captions.length ? `YouTube ${videoIndex}/${groups.size}: ${captions.length} timestamped caption segment(s) found with yt-dlp.` : `YouTube ${videoIndex}/${groups.size}: no usable captions; downloading audio for Whisper fallback.`,
         captions.length ? 'success' : 'warn',
         'Media Agent'
       );
     } catch (error) {
-      report?.(questions[0]?.sourceOrder ?? null, `Caption check skipped · ${shortError(error)}`, 'warn', 'Media Agent');
+      report?.(orderedQuestions[0]?.sourceOrder ?? null, `Caption check skipped · ${shortError(error)}`, 'warn', 'Media Agent');
     }
 
-    let alignments: VideoAlignment[] = [];
-    try {
-      report?.(questions[0]?.sourceOrder ?? null, `YouTube ${videoIndex}/${groups.size}: matching all related questions to video timestamps in one Gemini request.`, 'info', 'Alignment Agent');
-      alignments = await alignQuestionsWithYoutube(url, questions);
-      if (alignments.length) report?.(questions[0]?.sourceOrder ?? null, `YouTube ${videoIndex}/${groups.size}: ${alignments.length} semantic timestamp match(es) returned.`, 'success', 'Alignment Agent');
-    } catch (error) {
-      report?.(questions[0]?.sourceOrder ?? null, shortError(error), 'warn', 'Alignment Agent');
-    }
+    let localMatches = captions.length ? localAlignQuestions(orderedQuestions, captions, 'caption') : new Map<string, LocalAlignment>();
+    const lowCaptionConfidence = orderedQuestions.some(question => {
+      const match = localMatches.get(question.id);
+      return !match || match.guessed || match.confidence < 0.55;
+    });
 
     let fallbackMedia: MediaAnalysis | null = null;
-    const alignmentById = new Map(alignments.map(item => [item.questionId, item]));
-
-    for (const reference of questions) {
-      const flags: string[] = [];
-      const alignment = alignmentById.get(reference.id);
-      const captionMatch = captions.length ? bestSegment(reference, captions) : { segment: null, guessed: false };
-      let chosen: MediaSegment | null = null;
-      let transcript = '';
-
-      if (validAlignment(alignment)) {
-        const aligned = alignment!;
-        const captionTranscript = transcriptForRange(captions, aligned.start, aligned.end);
-        chosen = {
-          id: `SEG-${randomUUID()}`,
-          start: Math.max(0, aligned.start),
-          end: Math.min(aligned.end, aligned.start + 60),
-          text: captionTranscript || aligned.transcript,
-          score: aligned.confidence
-        };
-        transcript = chosen.text?.trim() ?? '';
-        flags.push('HYBRID_GEMINI_VIDEO_MATCH');
-        if (aligned.confidence < 0.75) flags.push('YOUTUBE_ALIGNMENT_MEDIUM_CONFIDENCE');
-        report?.(reference.sourceOrder, `Q${reference.sourceOrder}: video segment matched at ${Math.round(chosen.start)}s–${Math.round(chosen.end)}s (${Math.round(aligned.confidence * 100)}%).`, aligned.confidence >= 0.75 ? 'success' : 'warn', 'Alignment Agent');
-      } else if (captionMatch.segment && !captionMatch.guessed) {
-        chosen = captionMatch.segment;
-        transcript = chosen.text?.trim() ?? '';
-        flags.push('HYBRID_CAPTION_MATCH');
-        report?.(reference.sourceOrder, `Q${reference.sourceOrder}: matched from timestamped captions.`, 'success', 'Alignment Agent');
-      } else {
-        report?.(reference.sourceOrder, `Q${reference.sourceOrder}: caption/video confidence low; trying downloaded audio + Whisper fallback.`, 'warn', 'Alignment Agent');
-        try {
-          fallbackMedia ??= await cachedYoutube(url);
-          const fallback = bestSegment(reference, fallbackMedia.segments);
-          chosen = fallback.segment;
-          transcript = fallback.segment?.text?.trim() ?? '';
-          flags.push(fallbackMedia.transcriptAvailable ? 'HYBRID_WHISPER_FALLBACK' : 'HYBRID_AUDIO_FALLBACK');
-          if (fallback.guessed) flags.push('YOUTUBE_SEGMENT_GUESSED');
-          report?.(reference.sourceOrder, `Q${reference.sourceOrder}: local audio fallback ${fallbackMedia.transcriptAvailable ? 'with Whisper transcript' : 'without transcript'} prepared.`, fallback.guessed ? 'warn' : 'success', 'Media Agent');
-        } catch (error) {
-          flags.push(`YOUTUBE_FALLBACK_PENDING:${shortError(error)}`);
-          report?.(reference.sourceOrder, `Q${reference.sourceOrder}: local media fallback unavailable · ${shortError(error)}`, 'warn', 'Media Agent');
+    if (!captions.length || lowCaptionConfidence) {
+      try {
+        report?.(orderedQuestions[0]?.sourceOrder ?? null, `YouTube ${videoIndex}/${groups.size}: preparing local audio + Whisper transcript because captions are missing/uncertain.`, 'info', 'Media Agent');
+        fallbackMedia = await cachedYoutube(url);
+        if (fallbackMedia.transcriptAvailable && fallbackMedia.segments.some(segment => segment.text?.trim())) {
+          const whisperMatches = localAlignQuestions(orderedQuestions, fallbackMedia.segments, 'whisper');
+          for (const question of orderedQuestions) {
+            const captionMatch = localMatches.get(question.id);
+            const whisperMatch = whisperMatches.get(question.id);
+            if (!captionMatch || captionMatch.guessed || (whisperMatch && whisperMatch.confidence > captionMatch.confidence + 0.04)) {
+              if (whisperMatch) localMatches.set(question.id, whisperMatch);
+            }
+          }
+          report?.(orderedQuestions[0]?.sourceOrder ?? null, `YouTube ${videoIndex}/${groups.size}: Whisper/local timestamp matching completed.`, 'success', 'Alignment Agent');
+        } else {
+          report?.(orderedQuestions[0]?.sourceOrder ?? null, `YouTube ${videoIndex}/${groups.size}: Whisper transcript unavailable; ordered audio fallback will be used where necessary.`, 'warn', 'Alignment Agent');
         }
+      } catch (error) {
+        report?.(orderedQuestions[0]?.sourceOrder ?? null, `Local audio/Whisper fallback unavailable · ${shortError(error)}`, 'warn', 'Media Agent');
+      }
+    }
+
+    if (!localMatches.size && fallbackMedia?.segments.length) {
+      localMatches = localAlignQuestions(orderedQuestions, fallbackMedia.segments, fallbackMedia.transcriptAvailable ? 'whisper' : 'caption');
+    }
+
+    for (const reference of orderedQuestions) {
+      const flags: string[] = [];
+      let chosen = localMatches.get(reference.id)?.segment ?? null;
+      let transcript = chosen?.text?.trim() ?? '';
+      const localMatch = localMatches.get(reference.id);
+
+      if (localMatch?.method === 'caption-text') {
+        flags.push('LOCAL_CAPTION_TIMESTAMP_MATCH');
+        report?.(reference.sourceOrder, `Q${reference.sourceOrder}: locally matched from captions at ${Math.round(chosen!.start)}s–${Math.round(chosen!.end)}s (${Math.round(localMatch.confidence * 100)}%).`, 'success', 'Alignment Agent');
+      } else if (localMatch?.method === 'whisper-text') {
+        flags.push('LOCAL_WHISPER_TIMESTAMP_MATCH');
+        report?.(reference.sourceOrder, `Q${reference.sourceOrder}: locally matched from Whisper at ${Math.round(chosen!.start)}s–${Math.round(chosen!.end)}s (${Math.round(localMatch.confidence * 100)}%).`, 'success', 'Alignment Agent');
+      } else if (localMatch?.method === 'ordered-fallback') {
+        flags.push('LOCAL_ORDERED_TIMESTAMP_FALLBACK');
+        report?.(reference.sourceOrder, `Q${reference.sourceOrder}: low text overlap; source order was used as a local timestamp fallback.`, 'warn', 'Alignment Agent');
+      }
+
+      if (!chosen && fallbackMedia?.segments.length) {
+        const fallback = bestSegment(reference, fallbackMedia.segments);
+        chosen = fallback.segment;
+        transcript = chosen?.text?.trim() ?? '';
+        flags.push(fallbackMedia.transcriptAvailable ? 'LOCAL_WHISPER_FALLBACK' : 'LOCAL_AUDIO_FALLBACK');
+        if (fallback.guessed) flags.push('YOUTUBE_SEGMENT_GUESSED');
       }
 
       let audioAsset: AudioAsset | null = null;
@@ -199,7 +290,7 @@ export async function prepareListeningReferences(references: NormalizedQuestion[
           report?.(reference.sourceOrder, `Q${reference.sourceOrder}: exact source audio clip ready (${Math.round(chosen.end - chosen.start)}s).`, 'success', 'Media Agent');
         } catch (error) {
           flags.push(`SOURCE_AUDIO_NOT_READY:${shortError(error)}`);
-          report?.(reference.sourceOrder, `Q${reference.sourceOrder}: source clip unavailable; grounded transcript/TTS fallback remains available · ${shortError(error)}`, 'warn', 'Media Agent');
+          report?.(reference.sourceOrder, `Q${reference.sourceOrder}: source clip unavailable; transcript/TTS fallback remains available · ${shortError(error)}`, 'warn', 'Media Agent');
         }
       } else {
         flags.push('YOUTUBE_SEGMENT_NOT_FOUND');
