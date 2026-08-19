@@ -2,35 +2,124 @@
 
 Standalone single-user teacher-side EPS-TOPIK question production system.
 
-## Locked workflow
+## Normal workflow — one link, one button
 
-`Source -> Analyze -> Complete all 40 -> Listening/QA -> Optional Review -> Local Question Bank -> later Student App`
+```text
+Answered Google Forms score/result link
+        ↓
+BUILD 40Q
+        ↓
+Controller Agent
+        ↓
+Form Agent → Structure Agent → Media/Alignment Agents → Generator Agent → QA Agent
+        ↓
+Reading 20 → Listening 20
+        ↓
+40/40 complete
+        ↓
+Optional Review / Local Question Bank
+```
 
-Review is **never a blocking gate**. The system finishes the 40-question set first. The teacher can use/save it immediately, or open Optional Review and change only the questions/audio they want.
+The teacher does not have to open the Listening Studio or manually split YouTube audio during normal use. Review is **never a blocking gate**. The system completes all 40 questions first; review/edit/regenerate/audio-only actions remain available afterward.
 
-## v0.2 local factory
+## v0.5 Controller Agent pipeline
 
-- Google Forms `viewscore` / result URL import.
-- ZIP, PDF, DOCX, XLSX/XLS, CSV, TXT/Markdown/JSON ingestion.
-- Image/audio/video files stored in the local media pool.
-- Existing questions normalized into stem + options + answer + media + provenance.
-- Question type and Chapter 1-60 heuristic analysis.
-- 40-slot blueprint with Listening 1-20 and Reading 21-40.
-- Missing slots automatically generated so the pipeline reaches 40/40.
-- Pluggable AI providers: `mock`, `gemini`, `openai-compatible`.
-- Non-blocking deterministic QA plus possible duplicate detection.
-- Per-question edit, choices-only regenerate, full regenerate, explanation/script regenerate.
-- Revision history before edits/regeneration.
-- Local JSON question bank and saved exam sets under `data/`.
-- Voice Profile with narrator/male/female voices, speed and pause settings.
-- Windows local-system TTS (no API required) and optional OpenAI-compatible TTS adapter.
-- YouTube source audio download through `yt-dlp`.
-- Audio conversion/normalization/segmentation through `ffmpeg`/`ffprobe`.
-- Optional local Whisper CLI transcription hook.
-- Listening audio-only regeneration without rebuilding the question.
-- Localhost-only server (`127.0.0.1`).
+### Form Agent
 
-## Run
+- Fetches the answered Google Forms `viewscore` / result page.
+- Reads the actual DOM order instead of assuming question order from type alone.
+- Extracts question stem, four choices, answer evidence, images and YouTube links.
+- Runs a second `data-params` recovery pass when normal Google Forms blocks are incomplete.
+- Detects `읽기` / Reading and `듣기` / Listening section headings.
+- Uses YouTube placement as secondary structural evidence when headings are unavailable.
+
+### Structure Agent
+
+- Treats the detected Form order as the primary source of truth.
+- Target EPS set is **Reading 20 first, then Listening 20**.
+- Keeps structural warnings instead of silently guessing when source extraction is incomplete.
+- Creates R01–R20 and L01–L20 pattern slots while retaining Q1–Q40 display order.
+
+### Media + Alignment Agents
+
+A unique YouTube source is analyzed once and cached for all related Listening questions:
+
+```text
+YouTube
+  ↓
+Timestamped captions first
+  ↓
+Gemini video/timestamp alignment when configured
+  ↓
+Low confidence / no captions?
+  ↓
+yt-dlp audio + optional Whisper fallback
+  ↓
+FFmpeg exact source clip
+  ↓
+Grounded transcript/TTS fallback if a source clip cannot be produced
+```
+
+`yt-dlp` is automatically bootstrapped into the local `data/tools` directory when it is not already in PATH. Whisper remains optional. FFmpeg is used for exact source clipping and normalization.
+
+### Generator Agent
+
+- Generates fresh questions from source pattern/context rather than copying the source wording.
+- Batched requests reduce API usage.
+- Gemini and GLM/OpenAI-compatible provider priority/fallback is configurable in the app UI.
+- Listening generation receives the matched transcript/context when available.
+- Exactly four choices and one answer are required by the generator schema.
+
+### QA Agent
+
+Checks each completed question for:
+
+- non-empty stem
+- exactly four unique choices
+- valid answer index
+- valid Chapter 1–60 assignment
+- Reading/Listening section consistency
+- Listening script/source and audio readiness
+- possible duplicate similarity
+
+QA flags do not stop the factory from completing the 40-question set. The teacher can optionally review flagged items afterward.
+
+## Local API settings
+
+The local app UI supports:
+
+- Gemini API key + model
+- GLM 5.2 / NVIDIA OpenAI-compatible key + base URL + model
+- Gemini → GLM or GLM → Gemini fallback
+- Cloudflare account/token/image-model configuration
+- generation batch size
+
+Keys are saved only in the local `.env` file. They do not need to be pasted into chat or committed to Git.
+
+## Other source inputs
+
+The existing advanced factory also keeps support for:
+
+- ZIP
+- PDF
+- DOCX
+- XLSX/XLS
+- CSV
+- TXT / Markdown / JSON
+- images
+- audio/video files
+
+The primary workflow for the current project is the answered Google Form one-click Controller pipeline.
+
+## Run on Windows
+
+Download/extract the repository and double-click:
+
+```text
+Start-Question-Factory.bat
+```
+
+Or run manually:
 
 ```bash
 npm install
@@ -39,32 +128,9 @@ npm run dev
 
 Open `http://127.0.0.1:8787`.
 
-The app starts in `AI_PROVIDER=mock`, so the entire UI and 40Q pipeline can be tested before any API key is added.
-
-## Optional local tools for media/listening
-
-Install and place these in PATH when you want their features:
-
-- `ffmpeg` + `ffprobe` — audio conversion, normalization, cutting and assembly.
-- `yt-dlp` — download the teacher's YouTube listening sources.
-- `whisper` CLI — optional Korean transcription/segment timestamps.
-
-The **Voice & Tools** screen shows whether each tool is ready.
-
-## API provider later
-
-Copy `.env.example` to `.env`. The current code already supports:
-
-- `AI_PROVIDER=gemini` with `GEMINI_API_KEY`.
-- `AI_PROVIDER=openai-compatible` with `AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL`.
-- `TTS_PROVIDER=local-system` for installed Windows voices.
-- `openai-compatible` voice profiles using `TTS_BASE_URL`, `TTS_API_KEY`, `TTS_MODEL`.
-
-No API provider is required to build/test the local factory now.
-
 ## Local data
 
-Runtime data is intentionally outside Git:
+Runtime data stays outside Git:
 
 ```text
 data/
@@ -76,6 +142,7 @@ data/
   uploads/
   media/
   tts/
+  tools/
 ```
 
-This repository remains separate from the existing MT EPS TOPIK admin app. The future Student App should read only the final approved/published question bank, not the factory source workspace.
+The Question Factory remains separate from the existing MT EPS TOPIK admin/student apps. A future Student App should read only the final published/approved question bank, not the teacher source workspace.
